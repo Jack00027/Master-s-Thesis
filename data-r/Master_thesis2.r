@@ -9,6 +9,9 @@ library(dbplyr)
 library(RPostgres)
 library(arrow)
 
+
+# dake cakkzo dake
+
 # ── Parameters ─────────────────────────────────────────────────
 START_QUARTER  <- ymd("2005-01-01")
 END_QUARTER    <- ymd("2022-12-31")
