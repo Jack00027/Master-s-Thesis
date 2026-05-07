@@ -15,51 +15,35 @@ MAX_SINGLE_HOLDING_PCT  <- 0.75
 REPORT_DATE_WINDOW_DAYS <- 5
 SIZE_PCTL_CUTOFF        <- 0.20
 
-out_dir <- "data"
-dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-# ── Connect ─────────────────────────────────────────────────
+
+# ── WRDS connection ────────────────────────────────────────────
 wrds <- dbConnect(
   Postgres(),
-  host     = "wrds-pgdata.wharton.upenn.edu",
-  dbname   = "wrds",
-  port     = 9737,
-  sslmode  = "require",
-  user     = Sys.getenv("WRDS_USER"),
-  password = Sys.getenv("WRDS_PASSWORD")
+  host = "wrds-pgdata.wharton.upenn.edu", dbname = "wrds",
+  port = 9737, sslmode = "require",
+  user = Sys.getenv("WRDS_USER"), password = Sys.getenv("WRDS_PASSWORD")
 )
 
+tbl_13f     <- tbl(wrds, in_schema("factset_own", "wrds_own_13f"))
+tbl_fund    <- tbl(wrds, in_schema("factset_own", "wrds_own_fund"))
+tbl_sec_map <- tbl(wrds, in_schema("factset_own", "own_sec_entity_eq"))
+tbl_ent_fund <- tbl(wrds, in_schema("factset_own", "own_ent_funds"))
 
-# ================================================================
-# 0. DISCOVER TABLES — run once, then set config below
-# ================================================================
 
-print(# What FactSet schemas do you have access to?
-dbGetQuery(wrds, "
-  SELECT DISTINCT table_schema
-  FROM information_schema.tables
-  WHERE table_schema LIKE 'factset%'
-  ORDER BY 1
-")
-)
+# C. Sample rows where entity_type is NA
+tbl_fund |>
+  filter(is.na(entity_type),
+         report_date >= as.Date("2025-01-01"),
+         report_date <= as.Date("2025-12-31"),
+         iso_country == "US") |>
+  select(entity_proper_name, sec_entity_proper_name,
+         entity_type, adj_mv, iso_country) |>
+  head(20) |>
+  collect() |>
+  print()
 
-print(print(dbGetQuery(wrds, "
-  SELECT table_name
-  FROM information_schema.tables
-  WHERE table_schema = 'factset_own'
-  ORDER BY 1
-"))
-)
 
-print( dbGetQuery(wrds, "
-   SELECT DISTINCT entity_sub_type, COUNT(*)
-   FROM factset_own.own_ent_institutions
-   GROUP BY 1 ORDER BY 1
- "))
+tbl_ent_fund |> count(fund_type, sort = TRUE) |> collect() |> print()
 
- print(dbGetQuery(wrds, "
-   SELECT DISTINCT fund_type, COUNT(*)
-   FROM factset_own.own_ent_funds
-   GROUP BY 1 ORDER BY 1
- "))
 
