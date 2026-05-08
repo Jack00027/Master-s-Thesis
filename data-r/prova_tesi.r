@@ -29,21 +29,14 @@ tbl_13f     <- tbl(wrds, in_schema("factset_own", "wrds_own_13f"))
 tbl_fund    <- tbl(wrds, in_schema("factset_own", "wrds_own_fund"))
 tbl_sec_map <- tbl(wrds, in_schema("factset_own", "own_sec_entity_eq"))
 tbl_ent_fund <- tbl(wrds, in_schema("factset_own", "own_ent_funds"))
+tbl1 <- tbl(wrds, in_schema("factset_own", "own_ent_institutions"))
+
+fund_map <- tbl1 |> filter(!is.na(entity_sub_type)) |> 
+                            select(factset_entity_id, entity_sub_type)
 
 
-# C. Sample rows where entity_type is NA
-tbl_fund |>
-  filter(is.na(entity_type),
-         report_date >= as.Date("2025-01-01"),
-         report_date <= as.Date("2025-12-31"),
-         iso_country == "US") |>
-  select(entity_proper_name, sec_entity_proper_name,
-         entity_type, adj_mv, iso_country) |>
-  head(20) |>
-  collect() |>
-  print()
+tbl_13f |> count(entity_sub_type, sort = TRUE) |> collect() |> print()
 
-
-tbl_ent_fund |> count(fund_type, sort = TRUE) |> collect() |> print()
-
-
+tbl_13f |> select(factset_entity_id) |>
+           inner_join(fund_map, by = "factset_entity_id") |> 
+           count(entity_sub_type, sort = TRUE) |> collect() |> print()

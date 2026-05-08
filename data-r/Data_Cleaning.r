@@ -1,3 +1,8 @@
+# ================================================================
+# PS-BERT portfolio sequences from FactSet Ownership (WRDS)
+# Output: data/portfolio_sequences.parquet
+# ================================================================
+
 library(tidyverse)
 library(lubridate)
 library(dbplyr)
@@ -20,8 +25,8 @@ out_dir <- "data"
 TEST_MODE <- TRUE
 
 if (TEST_MODE) {
-  START_QUARTER <- ymd("2019-01-01")
-  END_QUARTER   <- ymd("2019-12-31")   # 4 quarters only
+  START_QUARTER <- ymd("2019-07-01")
+  END_QUARTER   <- ymd("2019-12-31")   # 2 quarters only
   # Keep MIN_STOCKS / MIN_INVESTORS as-is so cleaning logic is identical.
   # If too few rows survive pruning, lower these to e.g. 10 each.
   out_dir <- "data/test"
@@ -59,6 +64,9 @@ sec_map_lazy <- tbl_sec_map |>
   filter(!is.na(factset_entity_id)) |>
   select(fsym_id, issuer_id = factset_entity_id)
 
+fund_map <- tbl_ent_fund |> filter(!is.na(fund_type)) |> 
+                            select(factset_fund_id, fund_type)
+
 
 # ── 1. 13F holdings (hedge funds) ─────────────────────────────
 message("1. 13F holdings")
@@ -87,18 +95,19 @@ message("   ", format(nrow(holdings_13f), big.mark = ","), " rows")
 # ── 2. Fund holdings (MF, ETF, CEF, VA) ───────────────────────
 message("2. Fund holdings")
 
-
 holdings_fund <- map_dfr(quarter_ends, \(qe) {
   message("   ", qe)
   q_start <- qe - REPORT_WINDOW
   tbl_fund |>
-    filter(entity_type %in% c("MUT", "MUE", "MUC"),
+    inner_join(sec_map_lazy, by = "fsym_id") |>
+    inner_join(fund_map, by = "factset_fund_id") |>
+    filter(fund_type %in% c("OEF", "ETF", "CEF", "VAR"),
            report_date >= q_start,
            report_date <= qe,
            adj_mv > 0) |>
     select(investor_id = factset_fund_id, report_date, adj_mv,
-           investor_type = entity_type,
-           issuer_id = factset_sec_entity_id) |>
+           investor_type = fund_type,
+           issuer_id) |>
     collect() |>
     mutate(quarter_end = qe)
 }) |>
