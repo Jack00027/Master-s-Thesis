@@ -27,19 +27,16 @@ import argparse
 import json
 import math
 import random
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from tqdm.auto import tqdm
 from transformers import BertConfig, BertModel, BertForMaskedLM
 
 
@@ -247,9 +244,7 @@ def pretrain_mlm(model: BertForMaskedLM,
     for epoch in range(cfg.pretrain_epochs):
         model.train()
         running = 0.0
-        for ids, attn, labels in tqdm(train_loader,
-                                       desc=f"pretrain ep{epoch+1}",
-                                       leave=False):
+        for ids, attn, labels in train_loader:
             ids, attn, labels = ids.to(device), attn.to(device), labels.to(device)
             for g in optim.param_groups:
                 g["lr"] = cosine_lr(step, total_steps, cfg.pretrain_lr, warmup)
@@ -271,6 +266,10 @@ def pretrain_mlm(model: BertForMaskedLM,
                 out = model(input_ids=ids, attention_mask=attn, labels=labels)
                 running += out.loss.item() * ids.size(0)
         history["val_loss"].append(running / max(1, len(val_ds)))
+
+        print(f"    pretrain ep{epoch+1}/{cfg.pretrain_epochs}: "
+              f"train={history['train_loss'][-1]:.4f} "
+              f"val={history['val_loss'][-1]:.4f}")
 
     return history
 
@@ -307,8 +306,7 @@ def finetune_sentence_transformer(model: BertModel,
         model.train()
         running = 0.0
         n = 0
-        for (ids_a, attn_a), (ids_b, attn_b) in tqdm(
-                loader, desc=f"finetune ep{epoch+1}", leave=False):
+        for (ids_a, attn_a), (ids_b, attn_b) in loader:
             ids_a, attn_a = ids_a.to(device), attn_a.to(device)
             ids_b, attn_b = ids_b.to(device), attn_b.to(device)
             for g in optim.param_groups:
@@ -329,6 +327,8 @@ def finetune_sentence_transformer(model: BertModel,
             n += ea.size(0)
             step += 1
         history["loss"].append(running / max(1, n))
+        print(f"    finetune ep{epoch+1}/{cfg.finetune_epochs}: "
+              f"loss={history['loss'][-1]:.4f}")
 
     return history
 
@@ -347,8 +347,7 @@ def compute_investor_embeddings(model: BertModel,
     max_len = cfg.context_window + 2
 
     out = np.zeros((len(investors), cfg.hidden_size), dtype=np.float32)
-    for start in tqdm(range(0, len(investors), cfg.batch_size),
-                      desc="embed", leave=False):
+    for start in range(0, len(investors), cfg.batch_size):
         end = min(start + cfg.batch_size, len(investors))
         batch_ids, batch_attn = [], []
         for j in range(start, end):
@@ -520,4 +519,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
