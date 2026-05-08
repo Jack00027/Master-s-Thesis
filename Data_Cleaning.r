@@ -22,7 +22,7 @@ CONTEXT_WINDOW <- 62     # PS-BERT max sequence length
 out_dir <- "data"
 
 # ── Test mode ─────────────────────────────────────────────────
-TEST_MODE <- TRUE
+TEST_MODE <- FALSE
 
 if (TEST_MODE) {
   START_QUARTER <- ymd("2019-07-01")
