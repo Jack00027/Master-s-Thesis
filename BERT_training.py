@@ -1,8 +1,15 @@
 """
-PS-BERT training on quarterly portfolio sequences.
+PS-BERT training on quarterly portfolio sequences (simplified version).
 
-For each per-quarter parquet file produced by build_portfolio_sequences.R,
-this script:
+Functionally identical to the original BERT_training.py, but written with
+fewer classes:
+  - hyperparameters live in a plain dict (no @dataclass Config)
+  - vocabulary is a list + dict pair handled by helper functions (no Vocab class)
+  - MLMDataset / PairDataset stay as classes — PyTorch's DataLoader requires
+    objects that support len() and [] indexing, so this part can't be
+    plain functions without rewriting a chunk of PyTorch.
+
+For each per-quarter parquet file produced by the R pipeline, this script:
   1. Builds a per-quarter vocabulary of issuer tokens.
   2. Pre-trains a small BERT (4 layers, 2 heads, ctx=62) with masked-token
      prediction (15% masking, 80/10/10 split).
@@ -16,9 +23,9 @@ Outputs:
   models/q_YYYY-MM-DD/              # tokenizer + model checkpoints
 
 Usage:
-  python train_ps_bert.py --seq-dir data --emb-dir embeddings --model-dir models
-  python train_ps_bert.py --test                     # run on data/test only
-  python train_ps_bert.py --hidden-size 32           # 32-dim embeddings
+  python BERT_training.py --seq-dir data --emb-dir embeddings --model-dir models
+  python BERT_training.py --test                     # run on data/test only
+  python BERT_training.py --hidden-size 32           # 32-dim embeddings
 """
 
 from __future__ import annotations
@@ -27,9 +34,7 @@ import argparse
 import json
 import math
 import random
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -40,124 +45,128 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import BertConfig, BertModel, BertForMaskedLM
 
 
-# ── Config ────────────────────────────────────────────────────────────────
-@dataclass
-class Config:
-    # I/O
-    seq_dir:   str = "data"
-    emb_dir:   str = "embeddings"
-    model_dir: str = "models"
+# ── Hyperparameters ──────────────────────────────────────────────────────
+def default_config():
+    """Return a dict with all hyperparameters.
 
-    # Architecture (per the paper)
-    hidden_size:       int = 64    # embedding dimension d
-    num_layers:        int = 4
-    num_heads:         int = 2
-    intermediate_size: int = 256   # FFN width, conventional 4 * hidden
-    context_window:    int = 62    # tokens per portfolio
-    max_position:      int = 64    # 62 + [CLS] + [SEP]
+    Edit values here to change defaults, or override individual values from
+    the command line in main(). Access values with cfg["key"] notation.
+    """
+    return {
+        # I/O
+        "seq_dir":   "data",
+        "emb_dir":   "embeddings",
+        "model_dir": "models",
 
-    # MLM
-    mask_prob:        float = 0.15
-    mask_token_prob:  float = 0.80   # within masked: 80% [MASK]
-    random_token_prob: float = 0.10  # 10% random token
-    keep_token_prob:  float = 0.10   # 10% kept as-is
+        # Architecture (per the paper)
+        "hidden_size":       64,    # embedding dimension d
+        "num_layers":        4,
+        "num_heads":         2,
+        "intermediate_size": 256,   # FFN width, conventional 4 * hidden
+        "context_window":    62,    # tokens per portfolio
+        "max_position":      64,    # 62 + [CLS] + [SEP]
 
-    # Pre-training
-    batch_size:    int = 64
-    pretrain_lr:  float = 5e-4
-    pretrain_epochs: int = 10
-    weight_decay: float = 0.01
-    warmup_frac:  float = 0.1
-    train_split:  float = 0.9
+        # MLM
+        "mask_prob":         0.15,
+        "mask_token_prob":   0.80,  # within masked: 80% [MASK]
+        "random_token_prob": 0.10,  # 10% random token
+        "keep_token_prob":   0.10,  # 10% kept as-is
 
-    # Sentence-transformer fine-tuning
-    finetune_lr:    float = 2e-4
-    finetune_epochs: int = 3
+        # Pre-training
+        "batch_size":      64,
+        "pretrain_lr":     5e-4,
+        "pretrain_epochs": 10,
+        "weight_decay":    0.01,
+        "warmup_frac":     0.1,
+        "train_split":     0.9,
 
-    # Misc
-    seed:    int = 42
-    skip_existing: bool = True
-    device:  str = field(default_factory=lambda:
-        "cuda" if torch.cuda.is_available()
-        else ("mps" if torch.backends.mps.is_available() else "cpu"))
+        # Sentence-transformer fine-tuning
+        "finetune_lr":     2e-4,
+        "finetune_epochs": 3,
+
+        # Misc
+        "seed":          42,
+        "skip_existing": True,
+        "device":        ("cuda" if torch.cuda.is_available()
+                          else ("mps" if torch.backends.mps.is_available() else "cpu")),
+    }
 
 
-# ── Vocabulary ───────────────────────────────────────────────────────────
+# ── Vocabulary (functions instead of a class) ────────────────────────────
 SPECIAL_TOKENS = ["[PAD]", "[CLS]", "[SEP]", "[MASK]"]
+PAD_ID, CLS_ID, SEP_ID, MASK_ID = 0, 1, 2, 3
+SPECIAL_IDS = {PAD_ID, CLS_ID, SEP_ID, MASK_ID}
 
 
-class Vocab:
-    def __init__(self, tokens: List[str]):
-        unique = sorted(set(tokens))
-        self.itos = SPECIAL_TOKENS + unique
-        self.stoi = {t: i for i, t in enumerate(self.itos)}
+def build_vocab(tokens):
+    """Build the per-quarter vocabulary.
 
-    @property
-    def size(self):     return len(self.itos)
-    @property
-    def pad_id(self):   return self.stoi["[PAD]"]
-    @property
-    def cls_id(self):   return self.stoi["[CLS]"]
-    @property
-    def sep_id(self):   return self.stoi["[SEP]"]
-    @property
-    def mask_id(self):  return self.stoi["[MASK]"]
-    @property
-    def special_ids(self): return {self.pad_id, self.cls_id,
-                                   self.sep_id, self.mask_id}
-
-    def encode(self, tokens: List[str]) -> List[int]:
-        return [self.stoi[t] for t in tokens if t in self.stoi]
-
-    def save(self, path: Path):
-        path.write_text(json.dumps(self.itos))
-
-    @classmethod
-    def load(cls, path: Path) -> "Vocab":
-        v = cls.__new__(cls)
-        v.itos = json.loads(path.read_text())
-        v.stoi = {t: i for i, t in enumerate(v.itos)}
-        return v
+    Args:
+        tokens: a flat list of every asset id seen this quarter (duplicates fine).
+    Returns:
+        itos: list mapping integer id -> token string
+        stoi: dict mapping token string -> integer id
+    """
+    unique = sorted(set(tokens))
+    itos = SPECIAL_TOKENS + unique
+    stoi = {t: i for i, t in enumerate(itos)}
+    return itos, stoi
 
 
-# ── Datasets ─────────────────────────────────────────────────────────────
+def encode_tokens(tokens, stoi):
+    """Convert a list of token strings to a list of integer ids,
+    silently dropping any token not in stoi."""
+    return [stoi[t] for t in tokens if t in stoi]
+
+
+def save_vocab(itos, path):
+    Path(path).write_text(json.dumps(itos))
+
+
+def load_vocab(path):
+    """Load a vocab saved with save_vocab(). Returns (itos, stoi)."""
+    itos = json.loads(Path(path).read_text())
+    stoi = {t: i for i, t in enumerate(itos)}
+    return itos, stoi
+
+
+# ── Datasets (these MUST be classes — PyTorch requires it) ───────────────
 class MLMDataset(Dataset):
     """Yields (input_ids, attention_mask, labels) for masked-LM training."""
 
-    def __init__(self, sequences: List[List[int]], vocab: Vocab, cfg: Config):
+    def __init__(self, sequences, vocab_size, cfg):
         self.sequences = sequences
-        self.vocab = vocab
         self.cfg = cfg
-        self.max_len = cfg.context_window + 2  # [CLS] + 62 + [SEP]
+        self.max_len = cfg["context_window"] + 2  # [CLS] + 62 + [SEP]
         # Token IDs eligible for the "10% random" replacement
         self.replaceable_ids = [
-            i for i in range(vocab.size) if i not in vocab.special_ids
+            i for i in range(vocab_size) if i not in SPECIAL_IDS
         ]
 
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        body = self.sequences[idx][: self.cfg.context_window]
-        ids = [self.vocab.cls_id] + body + [self.vocab.sep_id]
+        body = self.sequences[idx][: self.cfg["context_window"]]
+        ids = [CLS_ID] + body + [SEP_ID]
         attn = [1] * len(ids)
         labels = [-100] * len(ids)  # -100 = ignore in CE loss
 
         # Mask 15% of body tokens
         for pos in range(1, len(ids) - 1):
-            if random.random() >= self.cfg.mask_prob:
+            if random.random() >= self.cfg["mask_prob"]:
                 continue
             labels[pos] = ids[pos]  # remember original
             r = random.random()
-            if r < self.cfg.mask_token_prob:
-                ids[pos] = self.vocab.mask_id
-            elif r < self.cfg.mask_token_prob + self.cfg.random_token_prob:
+            if r < self.cfg["mask_token_prob"]:
+                ids[pos] = MASK_ID
+            elif r < self.cfg["mask_token_prob"] + self.cfg["random_token_prob"]:
                 ids[pos] = random.choice(self.replaceable_ids)
             # else: keep as-is (10%)
 
         # Pad to max_len
         pad_len = self.max_len - len(ids)
-        ids    += [self.vocab.pad_id] * pad_len
+        ids    += [PAD_ID] * pad_len
         attn   += [0] * pad_len
         labels += [-100] * pad_len
 
@@ -173,22 +182,21 @@ class PairDataset(Dataset):
     Negatives are drawn implicitly via in-batch contrastive loss.
     """
 
-    def __init__(self, sequences: List[List[int]], vocab: Vocab, cfg: Config):
+    def __init__(self, sequences, cfg):
         # Only investors with >= 2 tokens can be split
         self.sequences = [s for s in sequences if len(s) >= 2]
-        self.vocab = vocab
         self.cfg = cfg
-        self.max_len = cfg.context_window + 2
+        self.max_len = cfg["context_window"] + 2
 
     def __len__(self):
         return len(self.sequences)
 
     def _build(self, body):
-        body = body[: self.cfg.context_window]
-        ids = [self.vocab.cls_id] + body + [self.vocab.sep_id]
+        body = body[: self.cfg["context_window"]]
+        ids = [CLS_ID] + body + [SEP_ID]
         attn = [1] * len(ids)
         pad_len = self.max_len - len(ids)
-        ids  += [self.vocab.pad_id] * pad_len
+        ids  += [PAD_ID] * pad_len
         attn += [0] * pad_len
         return (torch.tensor(ids,  dtype=torch.long),
                 torch.tensor(attn, dtype=torch.long))
@@ -200,54 +208,51 @@ class PairDataset(Dataset):
         return self._build(evens), self._build(odds)
 
 
-# ── Models ───────────────────────────────────────────────────────────────
-def build_bert_config(vocab_size: int, cfg: Config) -> BertConfig:
+# ── Model builder ────────────────────────────────────────────────────────
+def build_bert_config(vocab_size, cfg):
     return BertConfig(
-        vocab_size            = vocab_size,
-        hidden_size           = cfg.hidden_size,
-        num_hidden_layers     = cfg.num_layers,
-        num_attention_heads   = cfg.num_heads,
-        intermediate_size     = cfg.intermediate_size,
-        max_position_embeddings = cfg.max_position,
-        type_vocab_size       = 1,         # single segment
-        pad_token_id          = 0,
-        hidden_act            = "gelu",
+        vocab_size              = vocab_size,
+        hidden_size             = cfg["hidden_size"],
+        num_hidden_layers       = cfg["num_layers"],
+        num_attention_heads     = cfg["num_heads"],
+        intermediate_size       = cfg["intermediate_size"],
+        max_position_embeddings = cfg["max_position"],
+        type_vocab_size         = 1,         # single segment
+        pad_token_id            = PAD_ID,
+        hidden_act              = "gelu",
     )
 
 
 # ── Training loops ───────────────────────────────────────────────────────
-def cosine_lr(step: int, total: int, base_lr: float, warmup: int):
+def cosine_lr(step, total, base_lr, warmup):
     if step < warmup:
         return base_lr * step / max(1, warmup)
     progress = (step - warmup) / max(1, total - warmup)
     return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-def pretrain_mlm(model: BertForMaskedLM,
-                 train_ds: MLMDataset,
-                 val_ds: MLMDataset,
-                 cfg: Config) -> dict:
-    device = cfg.device
+def pretrain_mlm(model, train_ds, val_ds, cfg):
+    device = cfg["device"]
     model.to(device)
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
                               shuffle=True,  drop_last=False, num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=cfg.batch_size,
+    val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"],
                               shuffle=False, drop_last=False, num_workers=0)
 
-    optim = torch.optim.AdamW(model.parameters(), lr=cfg.pretrain_lr,
-                              weight_decay=cfg.weight_decay)
-    total_steps = max(1, len(train_loader) * cfg.pretrain_epochs)
-    warmup      = int(total_steps * cfg.warmup_frac)
+    optim = torch.optim.AdamW(model.parameters(), lr=cfg["pretrain_lr"],
+                              weight_decay=cfg["weight_decay"])
+    total_steps = max(1, len(train_loader) * cfg["pretrain_epochs"])
+    warmup      = int(total_steps * cfg["warmup_frac"])
 
     history = {"train_loss": [], "val_loss": []}
     step = 0
-    for epoch in range(cfg.pretrain_epochs):
+    for epoch in range(cfg["pretrain_epochs"]):
         model.train()
         running = 0.0
         for ids, attn, labels in train_loader:
             ids, attn, labels = ids.to(device), attn.to(device), labels.to(device)
             for g in optim.param_groups:
-                g["lr"] = cosine_lr(step, total_steps, cfg.pretrain_lr, warmup)
+                g["lr"] = cosine_lr(step, total_steps, cfg["pretrain_lr"], warmup)
             optim.zero_grad()
             out = model(input_ids=ids, attention_mask=attn, labels=labels)
             out.loss.backward()
@@ -267,33 +272,31 @@ def pretrain_mlm(model: BertForMaskedLM,
                 running += out.loss.item() * ids.size(0)
         history["val_loss"].append(running / max(1, len(val_ds)))
 
-        print(f"    pretrain ep{epoch+1}/{cfg.pretrain_epochs}: "
+        print(f"    pretrain ep{epoch+1}/{cfg['pretrain_epochs']}: "
               f"train={history['train_loss'][-1]:.4f} "
               f"val={history['val_loss'][-1]:.4f}")
 
     return history
 
 
-def finetune_sentence_transformer(model: BertModel,
-                                  pair_ds: PairDataset,
-                                  cfg: Config) -> dict:
+def finetune_sentence_transformer(model, pair_ds, cfg):
     """Siamese contrastive fine-tuning with in-batch negatives.
 
-    For each batch of pairs (a, b), compute investor embeddings
-    (mean-pooled over non-pad tokens), then maximize the cosine sim
-    between matched pairs while minimizing it for in-batch negatives
-    using a cross-entropy loss over the similarity matrix.
+    For each batch of pairs (a, b), compute investor embeddings (mean-pooled
+    over non-pad tokens), then maximize the cosine sim between matched pairs
+    while minimizing it for in-batch negatives using a cross-entropy loss
+    over the similarity matrix.
     """
-    device = cfg.device
+    device = cfg["device"]
     model.to(device)
-    loader = DataLoader(pair_ds, batch_size=cfg.batch_size,
+    loader = DataLoader(pair_ds, batch_size=cfg["batch_size"],
                         shuffle=True, drop_last=True, num_workers=0)
-    optim = torch.optim.AdamW(model.parameters(), lr=cfg.finetune_lr,
-                              weight_decay=cfg.weight_decay)
-    total_steps = max(1, len(loader) * cfg.finetune_epochs)
-    warmup      = int(total_steps * cfg.warmup_frac)
+    optim = torch.optim.AdamW(model.parameters(), lr=cfg["finetune_lr"],
+                              weight_decay=cfg["weight_decay"])
+    total_steps = max(1, len(loader) * cfg["finetune_epochs"])
+    warmup      = int(total_steps * cfg["warmup_frac"])
 
-    def encode(ids, attn):
+    def encode_batch(ids, attn):
         out = model(input_ids=ids, attention_mask=attn)
         h = out.last_hidden_state                    # (B, L, d)
         mask = attn.unsqueeze(-1).float()
@@ -302,7 +305,7 @@ def finetune_sentence_transformer(model: BertModel,
 
     history = {"loss": []}
     step = 0
-    for epoch in range(cfg.finetune_epochs):
+    for epoch in range(cfg["finetune_epochs"]):
         model.train()
         running = 0.0
         n = 0
@@ -310,11 +313,11 @@ def finetune_sentence_transformer(model: BertModel,
             ids_a, attn_a = ids_a.to(device), attn_a.to(device)
             ids_b, attn_b = ids_b.to(device), attn_b.to(device)
             for g in optim.param_groups:
-                g["lr"] = cosine_lr(step, total_steps, cfg.finetune_lr, warmup)
+                g["lr"] = cosine_lr(step, total_steps, cfg["finetune_lr"], warmup)
             optim.zero_grad()
 
-            ea = encode(ids_a, attn_a)               # (B, d)
-            eb = encode(ids_b, attn_b)               # (B, d)
+            ea = encode_batch(ids_a, attn_a)         # (B, d)
+            eb = encode_batch(ids_b, attn_b)         # (B, d)
             logits = ea @ eb.t() * 20.0              # temperature 1/20
             target = torch.arange(ea.size(0), device=device)
             loss = (F.cross_entropy(logits, target)
@@ -327,7 +330,7 @@ def finetune_sentence_transformer(model: BertModel,
             n += ea.size(0)
             step += 1
         history["loss"].append(running / max(1, n))
-        print(f"    finetune ep{epoch+1}/{cfg.finetune_epochs}: "
+        print(f"    finetune ep{epoch+1}/{cfg['finetune_epochs']}: "
               f"loss={history['loss'][-1]:.4f}")
 
     return history
@@ -335,27 +338,24 @@ def finetune_sentence_transformer(model: BertModel,
 
 # ── Embedding extraction ─────────────────────────────────────────────────
 @torch.no_grad()
-def compute_investor_embeddings(model: BertModel,
-                                investors: pd.DataFrame,
-                                vocab: Vocab,
-                                cfg: Config) -> np.ndarray:
+def compute_investor_embeddings(model, investors, stoi, cfg):
     """For each investor's top-62 sequence, return mean-pooled contextualized
     embedding.  investors must have one row per investor with tokens already
     truncated to <= 62 (the `tokens` column from your parquet)."""
-    device = cfg.device
+    device = cfg["device"]
     model.eval()
-    max_len = cfg.context_window + 2
+    max_len = cfg["context_window"] + 2
 
-    out = np.zeros((len(investors), cfg.hidden_size), dtype=np.float32)
-    for start in range(0, len(investors), cfg.batch_size):
-        end = min(start + cfg.batch_size, len(investors))
+    out = np.zeros((len(investors), cfg["hidden_size"]), dtype=np.float32)
+    for start in range(0, len(investors), cfg["batch_size"]):
+        end = min(start + cfg["batch_size"], len(investors))
         batch_ids, batch_attn = [], []
         for j in range(start, end):
-            body = vocab.encode(list(investors.iloc[j]["tokens"]))[:cfg.context_window]
-            ids  = [vocab.cls_id] + body + [vocab.sep_id]
+            body = encode_tokens(list(investors.iloc[j]["tokens"]), stoi)[:cfg["context_window"]]
+            ids  = [CLS_ID] + body + [SEP_ID]
             attn = [1] * len(ids)
             pad  = max_len - len(ids)
-            ids  += [vocab.pad_id] * pad
+            ids  += [PAD_ID] * pad
             attn += [0] * pad
             batch_ids.append(ids); batch_attn.append(attn)
         ids  = torch.tensor(batch_ids,  dtype=torch.long, device=device)
@@ -368,12 +368,12 @@ def compute_investor_embeddings(model: BertModel,
 
 
 # ── Per-quarter pipeline ─────────────────────────────────────────────────
-def process_quarter(parquet_path: Path, cfg: Config):
+def process_quarter(parquet_path, cfg):
     q_label = parquet_path.stem.replace("q_", "")  # "2019-09-30"
-    emb_path  = Path(cfg.emb_dir)   / f"q_{q_label}.parquet"
-    model_dir = Path(cfg.model_dir) / f"q_{q_label}"
+    emb_path  = Path(cfg["emb_dir"])   / f"q_{q_label}.parquet"
+    model_dir = Path(cfg["model_dir"]) / f"q_{q_label}"
 
-    if cfg.skip_existing and emb_path.exists():
+    if cfg["skip_existing"] and emb_path.exists():
         print(f"  [skip] q_{q_label} (embedding exists)")
         return
 
@@ -384,7 +384,6 @@ def process_quarter(parquet_path: Path, cfg: Config):
     if len(df) == 0:
         print("  (empty quarter, skipping)")
         return
-    # Each row already has tokens (list[str]) and n_tokens
     df["tokens"] = df["tokens"].apply(list)
 
     # Each investor may have multiple chunks (if portfolio > 62 assets).
@@ -398,31 +397,32 @@ def process_quarter(parquet_path: Path, cfg: Config):
 
     print(f"  {len(df):,} sequences from {first_chunks.shape[0]:,} investors")
 
-    # 2. Vocab
+    # 2. Vocab (now plain functions returning a list and a dict)
     flat = [t for seq in sequences_all for t in seq]
-    vocab = Vocab(flat)
-    print(f"  vocab: {vocab.size:,} tokens (incl. {len(SPECIAL_TOKENS)} special)")
+    itos, stoi = build_vocab(flat)
+    vocab_size = len(itos)
+    print(f"  vocab: {vocab_size:,} tokens (incl. {len(SPECIAL_TOKENS)} special)")
 
     # 3. Encode all sequences
-    encoded = [vocab.encode(s) for s in sequences_all]
+    encoded = [encode_tokens(s, stoi) for s in sequences_all]
 
     # 4. Train/val split (by investor for cleaner held-out)
-    rng = random.Random(cfg.seed)
+    rng = random.Random(cfg["seed"])
     inv_ids = df["investor_id"].unique().tolist()
     rng.shuffle(inv_ids)
-    n_train = int(len(inv_ids) * cfg.train_split)
+    n_train = int(len(inv_ids) * cfg["train_split"])
     train_inv = set(inv_ids[:n_train])
     train_idx = [i for i, inv in enumerate(df["investor_id"]) if inv in train_inv]
     val_idx   = [i for i, inv in enumerate(df["investor_id"]) if inv not in train_inv]
     train_seqs = [encoded[i] for i in train_idx]
     val_seqs   = [encoded[i] for i in val_idx]
 
-    train_ds = MLMDataset(train_seqs, vocab, cfg)
-    val_ds   = MLMDataset(val_seqs,   vocab, cfg)
+    train_ds = MLMDataset(train_seqs, vocab_size, cfg)
+    val_ds   = MLMDataset(val_seqs,   vocab_size, cfg)
 
     # 5. Pre-train BERT (MLM)
-    config = build_bert_config(vocab.size, cfg)
-    mlm = BertForMaskedLM(config)
+    bert_config = build_bert_config(vocab_size, cfg)
+    mlm = BertForMaskedLM(bert_config)
     print(f"  model: {sum(p.numel() for p in mlm.parameters()):,} params")
 
     pre_hist = pretrain_mlm(mlm, train_ds, val_ds, cfg)
@@ -431,8 +431,8 @@ def process_quarter(parquet_path: Path, cfg: Config):
 
     # 6. Sentence-transformer fine-tuning
     bert = mlm.bert  # shed the MLM head
-    pair_ds = PairDataset(train_seqs, vocab, cfg)
-    if len(pair_ds) >= cfg.batch_size:
+    pair_ds = PairDataset(train_seqs, cfg)
+    if len(pair_ds) >= cfg["batch_size"]:
         ft_hist = finetune_sentence_transformer(bert, pair_ds, cfg)
         print(f"  finetune final loss: {ft_hist['loss'][-1]:.4f}")
     else:
@@ -440,22 +440,22 @@ def process_quarter(parquet_path: Path, cfg: Config):
         print("  (skipping fine-tuning: too few pairs for one batch)")
 
     # 7. Investor embeddings (top-62 positions per investor)
-    embs = compute_investor_embeddings(bert, first_chunks, vocab, cfg)
+    embs = compute_investor_embeddings(bert, first_chunks, stoi, cfg)
 
     # 8. Save
-    Path(cfg.emb_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg["emb_dir"]).mkdir(parents=True, exist_ok=True)
     out_df = pd.DataFrame({
         "investor_id":   first_chunks["investor_id"].values,
         "investor_type": first_chunks["investor_type"].values,
         "quarter_end":   first_chunks["quarter_end"].values,
     })
-    for d in range(cfg.hidden_size):
+    for d in range(cfg["hidden_size"]):
         out_df[f"dim_{d:03d}"] = embs[:, d]
     out_df.to_parquet(emb_path, index=False)
 
     model_dir.mkdir(parents=True, exist_ok=True)
     torch.save(bert.state_dict(), model_dir / "bert.pt")
-    vocab.save(model_dir / "vocab.json")
+    save_vocab(itos, model_dir / "vocab.json")
     (model_dir / "history.json").write_text(json.dumps(
         {"pretrain": pre_hist, "finetune": ft_hist}, indent=2))
 
@@ -463,7 +463,7 @@ def process_quarter(parquet_path: Path, cfg: Config):
 
     # 9. Free memory
     del mlm, bert, train_ds, val_ds, pair_ds
-    if cfg.device == "cuda":
+    if cfg["device"] == "cuda":
         torch.cuda.empty_cache()
 
 
@@ -484,30 +484,30 @@ def main():
                    help="use data/test as input dir")
     args = p.parse_args()
 
-    cfg = Config()
-    cfg.seq_dir         = "data/test" if args.test else args.seq_dir
-    cfg.emb_dir         = "embeddings/test" if args.test else args.emb_dir
-    cfg.model_dir       = "models/test"     if args.test else args.model_dir
-    cfg.hidden_size     = args.hidden_size
-    cfg.pretrain_epochs = args.pretrain_epochs
-    cfg.finetune_epochs = args.finetune_epochs
-    cfg.batch_size      = args.batch_size
-    cfg.seed            = args.seed
-    cfg.skip_existing   = not args.no_skip
+    cfg = default_config()
+    cfg["seq_dir"]         = "data/test" if args.test else args.seq_dir
+    cfg["emb_dir"]         = "embeddings/test" if args.test else args.emb_dir
+    cfg["model_dir"]       = "models/test"     if args.test else args.model_dir
+    cfg["hidden_size"]     = args.hidden_size
+    cfg["pretrain_epochs"] = args.pretrain_epochs
+    cfg["finetune_epochs"] = args.finetune_epochs
+    cfg["batch_size"]      = args.batch_size
+    cfg["seed"]            = args.seed
+    cfg["skip_existing"]   = not args.no_skip
 
     # Reproducibility
-    random.seed(cfg.seed); np.random.seed(cfg.seed); torch.manual_seed(cfg.seed)
+    random.seed(cfg["seed"]); np.random.seed(cfg["seed"]); torch.manual_seed(cfg["seed"])
 
-    print(f"device         : {cfg.device}")
-    print(f"hidden_size    : {cfg.hidden_size}")
-    print(f"pretrain epochs: {cfg.pretrain_epochs}")
-    print(f"finetune epochs: {cfg.finetune_epochs}")
-    print(f"batch_size     : {cfg.batch_size}")
-    print(f"seq_dir        : {cfg.seq_dir}")
+    print(f"device         : {cfg['device']}")
+    print(f"hidden_size    : {cfg['hidden_size']}")
+    print(f"pretrain epochs: {cfg['pretrain_epochs']}")
+    print(f"finetune epochs: {cfg['finetune_epochs']}")
+    print(f"batch_size     : {cfg['batch_size']}")
+    print(f"seq_dir        : {cfg['seq_dir']}")
 
-    files = sorted(Path(cfg.seq_dir).glob("q_*.parquet"))
+    files = sorted(Path(cfg["seq_dir"]).glob("q_*.parquet"))
     if not files:
-        print(f"No q_*.parquet files found in {cfg.seq_dir}")
+        print(f"No q_*.parquet files found in {cfg['seq_dir']}")
         return
     print(f"\n{len(files)} quarters to process\n")
 
