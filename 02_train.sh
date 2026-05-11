@@ -8,7 +8,7 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH [email protected]
+#SBATCH --mail-user=h12429918@wu.ac.at
 
 # Full PS-BERT training sweep across all quarters in data/.
 #
