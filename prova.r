@@ -21,7 +21,7 @@ tbl_sec_map  <- tbl(wrds, in_schema("factset_own", "own_sec_entity_eq"))
 
 
 style_distribution <- tbl_13f |>
-  group_by(manager_style) |>
+  group_by(style) |>
   summarise(count = n()) |>
   arrange(desc(count)) |>
   collect() |>
