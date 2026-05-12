@@ -23,9 +23,9 @@ Positions are rolled up to the issuer-entity level rather than CUSIP, so multipl
 
 ### 2.2 Coverage
 
-2005-Q1 through 2025-Q4, **85 quarterly files** at `data/q_YYYY-MM-DD.parquet`.
+2005-Q1 through 2025-Q4, **84 quarterly files** at `data/q_YYYY-MM-DD.parquet`.
 
-R `seq.Date(by = "quarter")` starting from `2005-03-31` rolls invalid date arithmetic forward by one day, so Q2 and Q3 files are labelled `07-01` and `10-01` instead of `06-30` and `09-30`. Data inside the files is correct; only the `quarter_end` column and filenames are off by one day in those quarters.
+
 
 ### 2.3 Extraction
 
