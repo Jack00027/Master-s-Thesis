@@ -12,7 +12,7 @@ normalize <- function(path) {
   X    <- df |> select(starts_with("dim_")) |> as.matrix()
   
   norms  <- sqrt(rowSums(X^2))
-  X_norm <- X / norms                       # row-wise division (column-major recycling)
+  X_norm <- X / norms
   rownames(X_norm) <- df$investor_id
   
   list(meta = meta, X = X_norm, norms = norms)
