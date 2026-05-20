@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Verify that an embedding parquet from BERT_training.py looks sane.
 

@@ -61,14 +61,3 @@ cat(sprintf("style NAs: %d / %d (%.1f%%)\n",
             sum(is.na(clustered_data$style)),
             length(clustered_data$style),
             100 * mean(is.na(clustered_data$style))))
-
-# visualize the embeddings in 2D using umap, colored by cluster
-library(umap)
-umap_model <- umap(q$X)
-umap_data <- data.frame(UMAP1 = umap_model$layout[, 1], UMAP2 = umap_model$layout[, 2], cluster = factor(skm$cluster))
-print(ggplot(umap_data, aes(x = UMAP1, y = UMAP2, color = cluster)) +
-  geom_point(alpha = 0.5) +
-  labs(title = "UMAP of Normalized Embeddings Colored by Cluster") +
-  theme_minimal() +
-  theme(legend.position = "bottom")
-)
