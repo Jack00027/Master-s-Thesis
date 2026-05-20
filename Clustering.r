@@ -41,7 +41,7 @@ tbl_style <- tbl(wrds, in_schema("factset_own", "own_ent_institutions")) |>
 clustered_data <- q$meta %>%
   mutate(cluster = skm$cluster) %>%
   left_join(tbl_style, by = "investor_id") %>%
-  filter(!is.na(style)) %>%  # Optional: focus on investors with known styles
+  filter(!is.na(style)) %>% 
   collect()
 
 # Visualize the distribution of styles across clusters
