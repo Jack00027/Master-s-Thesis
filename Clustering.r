@@ -3,7 +3,7 @@ library(dplyr)
 library(ggplot2)
 library(skmeans)
 library(tidyr)
-library(cluster)   # silhouette()
+library(cluster)
 
 
 # We normalize the embeddings
