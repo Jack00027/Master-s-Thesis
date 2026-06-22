@@ -123,9 +123,93 @@ cluster_metrics_sphere <- function(X, labels, subsample = NULL, seed = 42) {
 
 q <- normalize("embeddings/q_2019-10-01.parquet")
 
-# cluster the normalized embeddings using spherical k-means
+
+# =====================================================================
+#  CHOOSE K — elbow on the spherical objective, plus silhouette / DB / CH.
+#  Reuses cluster_metrics_sphere() above. Silhouette is run on a subsample
+#  inside the sweep for speed (the full n x n cosine matrix is ~3 GB); the
+#  final clustering below still reports the exact full-sample silhouette.
+# =====================================================================
+K_RANGE <- 2:12     # cluster counts to try
+SWEEP_SEED <- 42
+SIL_SUB    <- 5000  # silhouette subsample size used during the sweep
+
+# within-cluster cosine distortion of a fit = sum_i (1 - <x_i, prototype_i>);
+# this is the quantity the elbow is read off (lower = tighter).
+skm_distortion <- function(X, fit) {
+  P <- fit$prototypes
+  P <- P / sqrt(rowSums(P^2))                 # ensure unit prototypes
+  sum(1 - rowSums(X * P[fit$cluster, , drop = FALSE]))
+}
+
+sweep_res <- data.frame()
+for (kk in K_RANGE) {
+  set.seed(SWEEP_SEED)
+  fit <- skmeans(q$X, kk, method = "pclust")
+  m   <- cluster_metrics_sphere(q$X, fit$cluster, subsample = SIL_SUB)
+  sweep_res <- rbind(sweep_res, data.frame(
+    k            = kk,
+    distortion   = skm_distortion(q$X, fit),
+    silhouette   = m$silhouette_mean,
+    db_spherical = m$db_spherical,
+    ch           = m$ch
+  ))
+  cat(sprintf("k=%2d  distortion=%9.1f  sil=%+.4f  DB=%.3f  CH=%.1f\n",
+              kk, tail(sweep_res$distortion, 1), m$silhouette_mean,
+              m$db_spherical, m$ch))
+  rm(fit, m); gc(verbose = FALSE)
+}
+
+sweep_res$avg_dissim <- sweep_res$distortion / nrow(q$X)             # per-investor
+sweep_res$pct_drop   <- c(NA, -diff(sweep_res$distortion) /
+                              head(sweep_res$distortion, -1) * 100)  # marginal gain
+
+# which k each criterion prefers
+k_sil <- sweep_res$k[which.max(sweep_res$silhouette)]
+k_db  <- sweep_res$k[which.min(sweep_res$db_spherical)]
+k_ch  <- sweep_res$k[which.max(sweep_res$ch)]
+
+cat(sprintf("\n=== K-sweep votes ===  silhouette: k=%d | DB-min: k=%d | CH-max: k=%d\n",
+            k_sil, k_db, k_ch))
+print(sweep_res, row.names = FALSE, digits = 4)
+
+# --- ELBOW GRAPH (the requested plot) ---
+elbow_plot <- ggplot(sweep_res, aes(k, avg_dissim)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2.5) +
+  geom_vline(xintercept = k_sil, linetype = "dashed", color = "grey40") +
+  scale_x_continuous(breaks = K_RANGE) +
+  labs(title    = "Elbow — spherical k-means",
+       subtitle = sprintf("dashed = silhouette-optimal k (%d)", k_sil),
+       x = "Number of clusters (k)",
+       y = "Avg within-cluster cosine dissimilarity") +
+  theme_minimal()
+print(elbow_plot)
+ggsave("elbow.pdf", elbow_plot, width = 7, height = 5)   # saved to getwd()
+
+# --- Cluster-quality criteria across k (silhouette / DB / CH) ---
+sweep_long <- sweep_res |>
+  select(k, silhouette, db_spherical, ch) |>
+  pivot_longer(-k, names_to = "metric", values_to = "value")
+criteria_plot <- ggplot(sweep_long, aes(k, value)) +
+  geom_line(color = "darkgreen", linewidth = 0.8) +
+  geom_point(color = "darkgreen", size = 1.8) +
+  facet_wrap(~ metric, scales = "free_y",
+             labeller = as_labeller(c(
+               silhouette   = "Cosine silhouette (higher better)",
+               db_spherical = "Davies-Bouldin spherical (lower better)",
+               ch           = "Calinski-Harabasz (higher better)"))) +
+  scale_x_continuous(breaks = K_RANGE) +
+  labs(title = "Cluster-quality criteria across k", x = "k", y = NULL) +
+  theme_minimal()
+print(criteria_plot)
+ggsave("k_criteria.pdf", criteria_plot, width = 9, height = 4)   # saved to getwd()
+
+
+# ---- final clustering at the chosen k -------------------------------------
+# set.seed + single run reproduces your validated headline numbers.
 set.seed(42)
-k <- 6
+k <- 6   # <-- update to k_sil (or your judgement) after reading the sweep above
 skm <- skmeans(q$X, k, method = "pclust")
 
 # internal cluster-quality metrics (computed on all investors, pre style join)

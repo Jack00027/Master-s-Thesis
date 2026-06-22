@@ -24,7 +24,14 @@ WRDS / FactSet Ownership
         │                   embeddings/q_YYYY-MM-DD.parquet
         │                   models/q_YYYY-MM-DD/
         ▼
-  Master_Thesis.ipynb    ── analysis (crowded-trade detection, TBD)
+  Clustering.r           ── spherical k-means, choose-k, style validation
+        │                   elbow.pdf, k_criteria.pdf
+        ▼
+  crowding_metric.R      ── crowding time series (HHI + tightness)
+        │                   crowding/crowding_timeseries.csv
+        │                   crowding/crowding_hhi.pdf
+        ▼
+  Master_Thesis.ipynb    ── downstream analysis (predictive tests, TBD)
 ```
 
 ## What's done so far
@@ -79,12 +86,52 @@ Outputs:
 Resumable: existing embedding files are skipped unless `--no-skip` is set.
 A `--test` flag runs against `data/test/`.
 
-### 3. Analysis notebook — [Master_Thesis.ipynb](Master_Thesis.ipynb)
+### 3. Investor clustering — [Clustering.r](Clustering.r)
 
-Skeleton only at this point — title cell and a hello-world. The downstream
-analysis (clustering investors by embedding, scoring stocks by cluster
-concentration, validating that crowded trades predict drawdowns) is the
-next step.
+Clusters investors *within a quarter* from their embeddings. Embeddings are
+L2-normalized so they live on the unit sphere, and clustering is done with
+**spherical k-means** (`skmeans`, `pclust` method, cosine geometry).
+
+- **Choose-k sweep** over `k = 2…12`. For each k it fits spherical k-means and
+  records the within-cluster cosine distortion (elbow), cosine silhouette,
+  spherical Davies–Bouldin, and Calinski–Harabasz, then reports which k each
+  criterion votes for. Two plots are written: [elbow.pdf](elbow.pdf) (avg
+  within-cluster cosine dissimilarity vs k) and
+  [k_criteria.pdf](k_criteria.pdf) (silhouette / DB / CH faceted across k).
+  Silhouette is evaluated on a 5 000-investor subsample during the sweep (the
+  full `n × n` cosine matrix is multi-GB).
+- **Internal metrics** are bundled in a reusable `cluster_metrics_sphere()`
+  helper: cosine silhouette (primary), spherical + Euclidean Davies–Bouldin,
+  Calinski–Harabasz, and a cosine-dispersion pseudo-CH.
+- **Final clustering** at the chosen **k = 6** (seed 42) is validated against
+  external FactSet investor **style** labels (`factset_styles.rds`):
+  style-composition-within-cluster and cluster-distribution-within-style
+  cross-tabs, plus a stacked style-by-cluster bar chart.
+
+### 4. Crowding metric — [crowding_metric.R](crowding_metric.R)
+
+Builds the **crowding time series** across all quarters. For each quarter it
+loads the normalized embeddings, runs spherical k-means at a **fixed k = 6**
+(held constant so the metric is comparable across time — the HHI floor is
+`1/K`), and computes two crowding measures:
+
+- **Cluster-concentration HHI** `HHI_t = Σ_c s_{c,t}²` of cluster shares (plus
+  a `[0,1]`-rescaled version and the effective number of clusters `1/HHI`).
+- **Tightness** — average within-cluster cosine similarity, computed via the
+  exact `O(n·d)` identity `(n·‖mean‖² − 1)/(n − 1)` instead of the `O(n²·d)`
+  pairwise matrix; reported as a size-weighted mean and for the largest cluster.
+
+Per-quarter cluster assignments are cached to `crowding/assignments/` (so a
+crashed run resumes), and "crowded" quarters are flagged when HHI exceeds the
+historical 90th / 95th percentile (with a commented expanding-window variant
+for the look-ahead-free predictive test). Outputs:
+`crowding/crowding_timeseries.csv` and `crowding/crowding_hhi.pdf`.
+
+### 5. Analysis notebook — [Master_Thesis.ipynb](Master_Thesis.ipynb)
+
+Skeleton only at this point. The remaining downstream analysis — cluster
+*transition* dynamics across quarters and validating that crowded trades
+predict subsequent drawdowns — is the next step.
 
 ## Repository layout
 
@@ -92,10 +139,15 @@ next step.
 .
 ├── Data_Cleaning.r         # WRDS → quarterly portfolio sequences
 ├── BERT_training.py        # PS-BERT training + investor embeddings
+├── Clustering.r            # spherical k-means + choose-k + style validation
+├── crowding_metric.R       # crowding time series (HHI + tightness)
 ├── Master_Thesis.ipynb     # analysis notebook (WIP)
 ├── data/                   # q_YYYY-MM-DD.parquet (one per quarter)
 ├── embeddings/             # q_YYYY-MM-DD.parquet (created by training)
 ├── models/                 # per-quarter checkpoints (created by training)
+├── crowding/               # crowding outputs + per-quarter assignments
+├── factset_styles.rds      # external FactSet investor style labels
+├── elbow.pdf, k_criteria.pdf  # choose-k diagnostics
 ├── .Renviron               # WRDS_USER / WRDS_PASSWORD (gitignored)
 └── README.md
 ```
@@ -122,6 +174,14 @@ Rscript Data_Cleaning.r
 python BERT_training.py
 # or, for a quick smoke test:
 python BERT_training.py --test
+
+# 3. Cluster investors for a single quarter + run the choose-k sweep
+#    (writes elbow.pdf, k_criteria.pdf; validates against FactSet styles)
+Rscript Clustering.r
+
+# 4. Build the crowding time series across all quarters
+#    (writes crowding/crowding_timeseries.csv and crowding/crowding_hhi.pdf)
+Rscript crowding_metric.R
 ```
 
 ## Key parameters
@@ -136,3 +196,8 @@ python BERT_training.py --test
 | BERT hidden / layers / heads | 64 / 4 / 2 | `BERT_training.py` |
 | MLM masking rate | 15% (80/10/10) | `BERT_training.py` |
 | Pre-train / fine-tune epochs | 10 / 3 | `BERT_training.py` |
+| Clustering algorithm | spherical k-means (`skmeans`, pclust) | `Clustering.r`, `crowding_metric.R` |
+| Number of clusters k | 6 (fixed across quarters) | `Clustering.r`, `crowding_metric.R` |
+| Clustering seed | 42 | `Clustering.r`, `crowding_metric.R` |
+| Choose-k sweep range | 2 … 12 | `Clustering.r` |
+| Crowded-quarter thresholds | 90th / 95th HHI percentile | `crowding_metric.R` |
