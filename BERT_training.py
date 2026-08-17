@@ -1,18 +1,35 @@
 """
-PS-BERT training on quarterly portfolio sequences.
+PS-BERT training on quarterly portfolio sequences (REPLICATION baseline).
 
-Combines the methodology of the asset-embeddings paper (Gabaix, Koijen,
-Mainardi, Oh, Yogo) with HuggingFace's standard BERT pretraining recipe
-(Trainer + DataCollatorForLanguageModeling), and adds the paper's
-sentence-transformer fine-tuning step in a manual loop.
+Implements the investor-embedding methodology of the asset-embeddings paper
+(Gabaix, Koijen, Richmond, Yogo), Section 3.4.3, using HuggingFace's standard
+BERT pretraining recipe (Trainer + DataCollatorForLanguageModeling) plus the
+paper's sentence-transformer fine-tuning step in a manual loop.
+
+Following the paper, the investor embedding is the UNWEIGHTED average
+contextualised embedding over the largest 62 positions. The sequence files
+now carry a `weights` column, but this script deliberately IGNORES it: that
+is the point of the replication, and the weighted variant lives in
+BERT_training_weighted.py so the two can be compared on identical inputs.
+
+Input schema (written by Data_Cleaning.r), one row per CHUNK:
+    quarter_end     date
+    investor_id     str
+    investor_type   str      OEF / ETF / CEF / VAR / HF
+    chunk_id        int      1 = top-62 positions, 2 = next 62, ...
+    tokens          list[str]  issuer ids, sorted by descending weight
+    weights         list[f64]  portfolio shares (UNUSED here, see above)
+    n_tokens        int      length of `tokens`
+    n_assets_full   int      positions in the whole portfolio
 
 Pipeline per quarter:
   1. Build a per-quarter vocabulary of issuer tokens.
   2. Wrap the vocabulary as a HuggingFace tokenizer.
-  3. Pre-train a small BERT with masked-token prediction (Trainer).
+  3. Pre-train a small BERT with masked-token prediction (Trainer),
+     on ALL chunks, so the tail of long books still shapes the encoder.
   4. Save the post-pretraining checkpoint (for "pretrained-only" ablation).
   5. Fine-tune with a sentence-transformer step (in-batch InfoNCE).
-  6. Compute mean-pooled investor embeddings and save as parquet.
+  6. Compute mean-pooled investor embeddings from chunk 1 and save as parquet.
 
 Outputs:
   embeddings/q_YYYY-MM-DD.parquet   # investor_id, investor_type, dim_000..dim_d-1
@@ -26,7 +43,7 @@ Outputs:
 Usage:
   python BERT_training.py --seq-dir data --emb-dir embeddings --model-dir models
   python BERT_training.py --test                     # run on data/test only
-  python BERT_training.py --hidden-size 32           # 32-dim embeddings
+  python BERT_training.py --hidden-size 128          # 128-dim embeddings
 """
 
 from __future__ import annotations
@@ -66,13 +83,12 @@ def default_config():
         "seq_dir":           "data",
         "emb_dir":           "embeddings",
         "model_dir":         "models",
-        # Architecture (per the paper)
+        # Architecture (per the paper: 4 layers, 2 heads, 62-asset context)
         "hidden_size":       64,
         "num_layers":        4,
         "num_heads":         2,
         "intermediate_size": 256,
         "context_window":    62,
-        "max_position":      64,    # 62 + [CLS] + [SEP]
         # Pretraining
         "mask_prob":         0.15,
         "batch_size":        64,
@@ -124,7 +140,7 @@ def build_tokenizer(itos, model_max_length):
 
 
 def encode_tokens(tokens, stoi):
-    """Convert ticker strings to integer ids (unknown -> [UNK])."""
+    """Convert issuer-id strings to integer ids (unknown -> [UNK])."""
     return [stoi.get(t, UNK_ID) for t in tokens]
 
 
@@ -147,8 +163,8 @@ def wrap_and_pad(body, max_len):
 # Datasets
 # =========================================================================
 class MLMDataset(Dataset):
-    """Yields one tokenized portfolio at a time. The data collator handles
-    the actual masking later, at batching time, using the tokenizer's
+    """Yields one tokenized portfolio chunk at a time. The data collator
+    handles the actual masking later, at batching time, using the tokenizer's
     knowledge of which token ids are special."""
 
     def __init__(self, sequences, max_len):
@@ -199,7 +215,8 @@ def build_bert_config(vocab_size, cfg):
         num_hidden_layers       = cfg["num_layers"],
         num_attention_heads     = cfg["num_heads"],
         intermediate_size       = cfg["intermediate_size"],
-        max_position_embeddings = cfg["max_position"],
+        # derived, so a change to context_window cannot silently desync it
+        max_position_embeddings = cfg["context_window"] + 2,
         type_vocab_size         = 1,
         pad_token_id            = PAD_ID,
         hidden_act              = "gelu",
@@ -225,6 +242,9 @@ def set_optimizer_lr(optimizer, lr):
 
 def mean_pool(hidden_states, attention_mask):
     """Mean-pool hidden states over non-pad positions.
+
+    This is the paper's "average contextualised embedding": every position
+    contributes equally, regardless of its portfolio weight.
 
     hidden_states:  (batch, seq_len, hidden_size)  - BERT's output vectors
     attention_mask: (batch, seq_len)               - 1 for real, 0 for pad
@@ -253,10 +273,7 @@ def contrastive_loss(emb_a, emb_b, temperature=20.0):
 
 
 def make_amp_context(device):
-    """Return an autocast context manager: bf16 on CUDA, no-op elsewhere.
-
-    Created once and reused with 'with ctx: ...' in the inner training loop.
-    """
+    """Return an autocast context manager: bf16 on CUDA, no-op elsewhere."""
     if device == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
@@ -270,8 +287,8 @@ def pretrain_mlm(model, train_dataset, val_dataset, tokenizer, cfg, output_dir):
     HuggingFace recipe: Trainer + DataCollatorForLanguageModeling.
 
     The data collator handles the 15% random masking with the 80/10/10 split
-    (80% replaced with [MASK], 10% random token, 10% kept), using the
-    tokenizer to know which token ids are special and shouldn't be masked.
+    (80% replaced with [MASK], 10% random token, 10% kept), matching the
+    paper's Section 3.4.3.
     """
     use_bf16 = (cfg["device"] == "cuda")
 
@@ -426,9 +443,34 @@ def compute_investor_embeddings(model, investors_df, stoi, cfg):
 # =========================================================================
 # Small pipeline helpers
 # =========================================================================
+def select_first_chunks(df):
+    """One row per investor: the chunk holding the largest 62 positions.
+
+    Data_Cleaning.r writes an explicit `chunk_id` (1 = top of the book), so
+    this is now a filter rather than an inference. The previous version
+    sorted by n_assets_full and took the first row per investor, which is
+    constant within an investor and therefore relied on the sort being
+    stable -- pandas' default quicksort is not. Older files without the
+    column fall back to file row order, which is what that code assumed.
+    """
+    if "chunk_id" in df.columns:
+        first = df[df["chunk_id"] == 1].reset_index(drop=True)
+        missing = df["investor_id"].nunique() - len(first)
+        if missing:
+            raise ValueError(
+                f"{missing} investor(s) have no chunk_id == 1; the sequence "
+                f"file looks malformed")
+        return first
+    print("  [warn] no chunk_id column; falling back to file row order")
+    return (df.groupby("investor_id", as_index=False, sort=False)
+              .head(1)
+              .reset_index(drop=True))
+
+
 def split_by_investor(df, encoded_sequences, train_split, seed):
     """Assign each investor (not each row) to train or val, then return
-    the corresponding lists of encoded sequences."""
+    the corresponding lists of encoded sequences. Splitting by investor
+    keeps all chunks of one portfolio on the same side of the split."""
     rng = random.Random(seed)
     investor_ids = df["investor_id"].unique().tolist()
     rng.shuffle(investor_ids)
@@ -471,7 +513,8 @@ def process_quarter(parquet_path, cfg):
     print(f"\n── q_{q_label} ──")
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load this quarter
+    # 1. Load this quarter. The `weights` column is present but deliberately
+    #    unused: this script is the unweighted replication.
     df = pd.read_parquet(parquet_path)
     if len(df) == 0:
         print("  (empty quarter, skipping)")
@@ -480,13 +523,12 @@ def process_quarter(parquet_path, cfg):
     sequences = df["tokens"].tolist()
 
     # Investors with >62 holdings are split into multiple chunks by the
-    # R pipeline. We train on all chunks but embed only the FIRST chunk
-    # (top-62 positions) per investor.
-    first_chunks = (df.sort_values(["investor_id", "n_assets_full"],
-                                   ascending=[True, False])
-                      .drop_duplicates("investor_id", keep="first")
-                      .reset_index(drop=True))
-    print(f"  {len(df):,} sequences from {len(first_chunks):,} investors")
+    # R pipeline. We train on ALL chunks but embed only the FIRST chunk
+    # (top-62 positions) per investor, as in the paper.
+    first_chunks = select_first_chunks(df)
+    n_multi = int((df.groupby("investor_id").size() > 1).sum())
+    print(f"  {len(df):,} sequences from {len(first_chunks):,} investors "
+          f"({n_multi:,} with >1 chunk)")
 
     # 2. Vocab + HF tokenizer
     all_tokens = [t for seq in sequences for t in seq]
@@ -534,7 +576,12 @@ def process_quarter(parquet_path, cfg):
         embeddings, first_chunks, cfg["hidden_size"], emb_path)
     torch.save(bert.state_dict(), model_dir / "bert.pt")
     (model_dir / "history.json").write_text(json.dumps(
-        {"pretrain_log": pretrain_log, "finetune": finetune_history},
+        {"config": {k: v for k, v in cfg.items()},
+         "pretrain_log": pretrain_log,
+         "finetune": finetune_history,
+         "n_investors": int(len(first_chunks)),
+         "n_sequences": int(len(df)),
+         "vocab_size": int(vocab_size)},
         indent=2, default=str))
     print(f"  saved -> {emb_path}")
 
@@ -553,12 +600,23 @@ def main():
     parser.add_argument("--emb-dir",         default="embeddings")
     parser.add_argument("--model-dir",       default="models")
     parser.add_argument("--hidden-size",     type=int, default=64)
+    parser.add_argument("--context-window",  type=int, default=62,
+                        help="per the paper: 62 assets")
     parser.add_argument("--pretrain-epochs", type=int, default=10)
     parser.add_argument("--finetune-epochs", type=int, default=3)
     parser.add_argument("--batch-size",      type=int, default=64)
     parser.add_argument("--seed",            type=int, default=42)
+    parser.add_argument("--start", default=None, metavar="YYYY-MM-DD",
+                        help="process only quarters on or after this date")
+    parser.add_argument("--end",   default=None, metavar="YYYY-MM-DD",
+                        help="process only quarters on or before this date")
+    parser.add_argument("--only", nargs="+", default=None, metavar="YYYY-MM-DD",
+                        help="process exactly these quarters, e.g. "
+                             "--only 2025-03-31 2025-06-30")
     parser.add_argument("--no-skip", action="store_true",
                         help="re-train quarters even if embedding exists")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="list the quarters that would be processed, then exit")
     parser.add_argument("--test", action="store_true",
                         help="use data/test as input dir")
     args = parser.parse_args()
@@ -568,6 +626,7 @@ def main():
     cfg["emb_dir"]         = "embeddings/test" if args.test else args.emb_dir
     cfg["model_dir"]       = "models/test"     if args.test else args.model_dir
     cfg["hidden_size"]     = args.hidden_size
+    cfg["context_window"]  = args.context_window
     cfg["pretrain_epochs"] = args.pretrain_epochs
     cfg["finetune_epochs"] = args.finetune_epochs
     cfg["batch_size"]      = args.batch_size
@@ -580,6 +639,8 @@ def main():
 
     print(f"device         : {cfg['device']}")
     print(f"hidden_size    : {cfg['hidden_size']}")
+    print(f"context_window : {cfg['context_window']}")
+    print(f"pooling        : mean (unweighted, per the paper)")
     print(f"pretrain epochs: {cfg['pretrain_epochs']}")
     print(f"finetune epochs: {cfg['finetune_epochs']}")
     print(f"batch_size     : {cfg['batch_size']}")
@@ -590,7 +651,42 @@ def main():
     if not files:
         print(f"No q_*.parquet files found in {cfg['seq_dir']}")
         return
-    print(f"\n{len(files)} quarters to process\n")
+
+    # ---- restrict to the requested quarters ------------------------------
+    def label(p):
+        return p.stem.replace("q_", "")
+
+    n_all = len(files)
+    if args.only:
+        wanted = set(args.only)
+        files = [f for f in files if label(f) in wanted]
+        missing = wanted - {label(f) for f in files}
+        if missing:
+            print(f"ERROR: requested quarter(s) not found in {cfg['seq_dir']}: "
+                  f"{', '.join(sorted(missing))}")
+            return
+    else:
+        if args.start:
+            files = [f for f in files if label(f) >= args.start]
+        if args.end:
+            files = [f for f in files if label(f) <= args.end]
+
+    if not files:
+        print("No quarters left after filtering.")
+        return
+
+    print(f"\nSelected {len(files)} of {n_all} quarters: "
+          f"{label(files[0])} .. {label(files[-1])}")
+    for f in files:
+        emb = Path(cfg["emb_dir"]) / f"q_{label(f)}.parquet"
+        state = "EXISTS -> would skip" if (emb.exists() and cfg["skip_existing"]) \
+                else ("EXISTS -> will overwrite" if emb.exists() else "new")
+        print(f"    {label(f):12s}  {state}")
+
+    if args.dry_run:
+        print("\nDry run: nothing was trained.")
+        return
+    print()
 
     for path in files:
         process_quarter(path, cfg)

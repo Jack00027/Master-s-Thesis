@@ -1,0 +1,127 @@
+
+=== own_ent_13f_combined_inst (3 cols)
+factset_filer_entity_id, factset_rollup_entity_id, active 
+
+=== own_ent_13f_filing_hist (6 cols)
+factset_13f_filer_entity_id, form_type, report_date, transfer_date, filing_date, factset_entity_id 
+
+=== own_ent_13f_subfiler_inst (3 cols)
+factset_subfiler_entity_id, factset_filer_entity_id, active 
+
+=== own_ent_address (2 cols)
+address_id, factset_entity_id 
+
+=== own_ent_coverage (8 cols)
+factset_entity_id, is_issuer, is_fund, is_inst, is_stakeholder, is_uksr_holder, is_uksr_bo_holder,
+is_contact 
+
+=== own_ent_fund_filing_hist (6 cols)
+factset_fund_id, form_type, report_date, transfer_date, filing_date, total_reported_mv 
+
+=== own_ent_fund_identifiers (5 cols)
+factset_fund_id, fund_ticker, fund_identifier, identifier_type, active 
+
+=== own_ent_fund_managers (2 cols)
+factset_inst_entity_id, factset_fund_id 
+
+=== own_ent_fund_objectives (7 cols)
+factset_fund_id, invt_obj_code, invt_obj_bus_code, invt_obj_specialization_code,
+invt_obj_asset_type_code, invt_obj_region_code, invt_obj_country_code 
+
+=== own_ent_funds (16 cols)
+factset_fund_id, factset_inst_entity_id, fund_type, current_report_date, style, turnover_label,
+pe_ratio, pb_ratio, dividend_yield, sales_growth, price_momentum, relative_strength, beta,
+fund_family, etf_type, active_flag 
+
+=== own_ent_funds_feeder_master (2 cols)
+factset_feeder_fund_id, factset_master_fund_id 
+
+=== own_ent_inst_identifiers (3 cols)
+factset_entity_id, entity_id_type, entity_id_value 
+
+=== own_ent_inst_profiles (3 cols)
+factset_entity_id, entity_profile_type, entity_profile 
+
+=== own_ent_institutions (8 cols)
+factset_entity_id, current_report_date, style, manager_style, turnover_label, total_aum,
+entity_sub_type, fds_13f_flag 
+
+=== own_fund_detail_eq (7 cols)
+factset_fund_id, fsym_id, report_date, adj_holding, adj_mv, reported_holding, reported_mv 
+
+=== own_fund_generic_eq (4 cols)
+factset_fund_id, generic_id, report_date, reported_mv 
+
+=== own_fund_generic_summary_fi (4 cols)
+factset_fund_id, generic_id, report_date, reported_mv 
+
+=== own_insider_trans_eq (24 cols)
+factset_entity_id, fsym_id, sec_accession_number, trade_number, reported_title, tran_shares,
+tran_price, tran_value, trade_date, direct_indirect, tran_code, form_type, tran_acq_disp,
+reported_shares_owned, deriv_nonderiv, lionshares_position, lionshares_as_of_date, exercise_price,
+exercise_date, rule_10b5_1, attrib, tran_date, effective_date, filing_date 
+
+=== own_inst_13f_detail_eq (6 cols)
+factset_entity_id, fsym_id, report_date, adj_holding, adj_mv, reported_holding 
+
+=== own_inst_stakes_detail_eq (8 cols)
+factset_entity_id, fsym_id, as_of_date, position, indirect_options, source_code, comments,
+current_flag 
+
+=== own_sec_13f_reportable_eq (3 cols)
+fsym_id, report_date, status 
+
+=== own_sec_adr_ord_ratio_eq (3 cols)
+adr_fsym_id, one_adr_eq, ord_fsym_id 
+
+=== own_sec_coverage_eq (14 cols)
+fsym_id, security_name, iso_country, attrib, mic_exchange_code, issue_type, cap_group, adjdate,
+votes, active, universe_type, fds_13f_flag, fds_13f_ca_flag, fds_uksr_flag 
+
+=== own_sec_entity_eq (2 cols)
+fsym_id, factset_entity_id 
+
+=== own_sec_entity_hist_eq (4 cols)
+fsym_id, start_date, end_date, factset_entity_id 
+
+=== own_sec_map_eq (2 cols)
+fsym_id, fsym_company_id 
+
+=== own_sec_prices_eq (6 cols)
+fsym_id, price_date, unadj_price, unadj_shares_outstanding, adj_price, adj_shares_outstanding 
+
+=== own_stakes_detail_eq (8 cols)
+factset_entity_id, fsym_id, position, indirect_options, report_date, source_code, comments,
+current_flag 
+
+=== own_uksr_cust_detail_eq (5 cols)
+factset_entity_id, fsym_id, report_date, position, source_code 
+
+=== own_uksr_detail_eq (6 cols)
+factset_bo_entity_id, factset_entity_id, fsym_id, report_date, position, source_code 
+
+=== wrds_holdings_by_firm_msci (26 cols)
+factset_entity_id, quarter, rquarter, sec_country, entity_proper_name, isin, cusip, sedol,
+ticker, mktcap, io_usd, nbr_firms, io, io_dom, io_for, io_for_us, io_for_nus, io_common, io_civil,
+io_for_common, io_for_civil, ibh_5pct, ibh_1pct, top5, herf, io_top3_passive 
+
+=== wrds_holdings_by_security_msci (34 cols)
+fsym_id, quarter, rquarter, company_id, sec_country, proper_name, entity_proper_name, header_sic,
+fsym_primary_listing_id, fsym_primary_equity_id, issue_type, fref_security_type, ticker, isin,
+sedol, cusip, primary_equity_mktcap, own_mktcap, io_usd, nbr_firms, io, io_dom, io_for, io_for_us,
+io_for_nus, io_common, io_civil, io_for_common, io_for_civil, ibh_5pct, ibh_1pct, top5, herf,
+io_top3_passive 
+
+=== wrds_own_13f (19 cols)
+factset_entity_id, entity_proper_name, entity_type, iso_country, entity_sub_type,
+entity_sub_type_desc, current_report_date, style, manager_style, turnover_label, fsym_id, cusip,
+isin, proper_name, fref_security_type, report_date, adj_holding, adj_mv, reported_holding 
+
+=== wrds_own_fund (35 cols)
+factset_fund_id, entity_proper_name, iso_country, iso_country_incorp, entity_type,
+entity_sub_type, primary_sic_code, fsym_id, cusip, isin, sedol, fsym_primary_equity_id,
+listing_flag, security_name, sec_iso_country, sec_currency, mic_exchange_code, issue_type,
+cap_group, fref_listing_exchange, universe_type, factset_sec_entity_id, sec_entity_proper_name,
+sic_primary_sic_code, sec_firm_iso_country, sec_firm_iso_country_incorp, report_date, adj_holding,
+adj_mv, adj_shares_outstanding, adj_price, reported_holding, reported_mv, unadj_shares_outstanding,
+unadj_price 
