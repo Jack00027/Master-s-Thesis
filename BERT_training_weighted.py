@@ -227,15 +227,15 @@ def assemble_portfolios(df, cfg):
     """Turn the chunked sequence table into one record per investor.
 
     The R pipeline splits portfolios longer than 62 positions into
-    consecutive chunks, written in rank order. Chunk order is recovered
-    from FILE ROW ORDER, which is what the R `unnest()` produced.
+    consecutive chunks and now writes an explicit `chunk_id` (1 = top of
+    the book), so ordering is read rather than inferred. Older files
+    without the column fall back to file row order, which is what the
+    pipeline produced before `chunk_id` existed.
 
-    NOTE: the original script recovered the first chunk with
-    sort_values(["investor_id","n_assets_full"]) + drop_duplicates.
-    n_assets_full is constant within an investor, so that relies on the
-    sort being stable -- pandas' default quicksort is NOT. Here row order
-    is captured explicitly instead. Adding an explicit `chunk_id` column
-    in the R pipeline would make this airtight.
+    Chunk order matters here in a way it does not for the unweighted
+    baseline: weights are normalised across the WHOLE portfolio, so a
+    mis-ordered chunk would receive the wrong slice of the weight vector
+    and the tail of the book would be weighted as if it were the head.
 
     Returns a DataFrame with one row per investor:
       investor_id, investor_type, quarter_end, n_assets_full,
@@ -244,13 +244,20 @@ def assemble_portfolios(df, cfg):
                 to sum to 1 ACROSS THE WHOLE PORTFOLIO
     """
     df = df.reset_index(drop=True).copy()
-    df["_row"] = np.arange(len(df))
+
+    if "chunk_id" in df.columns:
+        order_col = "chunk_id"
+    else:
+        print("  [warn] no chunk_id column; falling back to file row order")
+        df["_row"] = np.arange(len(df))
+        order_col = "_row"
 
     real_w_col = cfg["weight_col"] if cfg["weight_col"] in df.columns else None
     cfg["_real_weights"] = real_w_col is not None
 
     records = {}
-    for row in df.sort_values(["investor_id", "_row"]).itertuples(index=False):
+    for row in df.sort_values(["investor_id", order_col],
+                              kind="mergesort").itertuples(index=False):
         rec = records.setdefault(row.investor_id, {
             "investor_id":   row.investor_id,
             "investor_type": getattr(row, "investor_type", None),
@@ -273,6 +280,8 @@ def assemble_portfolios(df, cfg):
             flat = np.concatenate(rec["raw_weights"]) if rec["raw_weights"] \
                    else np.ones(n_total)
             flat = np.clip(flat, 0.0, None)
+            if len(flat) != n_total:            # weights/tokens out of step
+                flat = np.ones(n_total)
             s = flat.sum()
             flat = flat / s if s > 0 else np.full(n_total, 1.0 / max(n_total, 1))
         else:
@@ -818,6 +827,14 @@ def main():
                         default="power",
                         help="rank-decay used when real weights are absent")
     parser.add_argument("--weight-alpha", type=float, default=0.75)
+    parser.add_argument("--start", default=None, metavar="YYYY-MM-DD",
+                        help="process only quarters on or after this date")
+    parser.add_argument("--end",   default=None, metavar="YYYY-MM-DD",
+                        help="process only quarters on or before this date")
+    parser.add_argument("--only", nargs="+", default=None, metavar="YYYY-MM-DD",
+                        help="process exactly these quarters")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="list the quarters that would be processed, then exit")
     parser.add_argument("--no-skip", action="store_true",
                         help="re-train quarters even if embedding exists")
     parser.add_argument("--test", action="store_true",
@@ -869,7 +886,46 @@ def main():
     if not files:
         print(f"No q_*.parquet files found in {cfg['seq_dir']}")
         return
-    print(f"\n{len(files)} quarters to process\n")
+
+    # ---- restrict to the requested quarters ------------------------------
+    def label(p):
+        return p.stem.replace("q_", "")
+
+    n_all = len(files)
+    if args.only:
+        wanted = set(args.only)
+        files = [f for f in files if label(f) in wanted]
+        missing = wanted - {label(f) for f in files}
+        if missing:
+            print(f"ERROR: requested quarter(s) not found in {cfg['seq_dir']}: "
+                  f"{', '.join(sorted(missing))}")
+            return
+    else:
+        if args.start:
+            files = [f for f in files if label(f) >= args.start]
+        if args.end:
+            files = [f for f in files if label(f) <= args.end]
+
+    if not files:
+        print("No quarters left after filtering.")
+        return
+
+    # the variant tag is only final once a file has been read (it depends on
+    # whether real weights are present), so report the tag as configured
+    tag_preview = variant_tag(cfg)
+    print(f"\nSelected {len(files)} of {n_all} quarters: "
+          f"{label(files[0])} .. {label(files[-1])}")
+    print(f"Output name pattern: q_<quarter>__{tag_preview}.parquet")
+    for f in files:
+        emb = Path(cfg["emb_dir"]) / f"q_{label(f)}__{tag_preview}.parquet"
+        state = "EXISTS -> would skip" if (emb.exists() and cfg["skip_existing"]) \
+                else ("EXISTS -> will overwrite" if emb.exists() else "new")
+        print(f"    {label(f):12s}  {state}")
+
+    if args.dry_run:
+        print("\nDry run: nothing was trained.")
+        return
+    print()
 
     for path in files:
         process_quarter(path, cfg)
