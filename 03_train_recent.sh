@@ -42,13 +42,22 @@ set -euo pipefail
 QUARTERS="2025-03-31 2025-06-30 2025-09-30 2025-12-31 2026-03-31"
 PROJECT_DIR="$HOME/Master-s-Thesis"
 
+# Output goes to NEW directories, leaving the previous run untouched.
+# embeddings/ holds output from the OLD token files; mixing the two
+# would leave no way to tell which dataset an embedding came from,
+# and for 2025-Q2/Q3 the old files even carry different names
+# (q_2025-07-01, q_2025-10-01) for the same economic quarter.
+EMB_DIR="embeddings_v2"
+MODEL_DIR="models_v2"
+
 # --dry-run works on the login node without SLURM
 if [[ "${1:-}" == "--dry-run" ]]; then
     module load miniconda3
     eval "$(conda shell.bash hook)"
     conda activate psbert
     cd "$PROJECT_DIR"
-    python BERT_training.py --only $QUARTERS --no-skip --dry-run
+    python BERT_training.py --only $QUARTERS --no-skip --dry-run \
+        --emb-dir "$EMB_DIR" --model-dir "$MODEL_DIR"
     exit 0
 fi
 
@@ -60,6 +69,7 @@ echo "Job ID:    ${SLURM_JOB_ID:-unknown}"
 echo "Node:      $(hostname)"
 echo "Started:   $(date)"
 echo "Quarters:  $QUARTERS"
+echo "Output:    $EMB_DIR/ and $MODEL_DIR/"
 echo "═══════════════════════════════════════════════════════════════"
 
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
@@ -103,13 +113,16 @@ PY
 
 echo ""
 echo ">>> Training"
-# --no-skip: rebuild even where an embedding from the old run exists (see above)
-python BERT_training.py --only $QUARTERS --no-skip
+# --no-skip is kept as a belt-and-braces guard: with a fresh output
+# directory nothing should exist yet, but it also makes a re-submission
+# after a partial failure rebuild rather than silently skip.
+python BERT_training.py --only $QUARTERS --no-skip \
+    --emb-dir "$EMB_DIR" --model-dir "$MODEL_DIR"
 
 echo ""
 echo ">>> Resulting embedding files"
 for q in $QUARTERS; do
-    ls -lh "embeddings/q_${q}.parquet" 2>/dev/null || echo "    MISSING q_${q}"
+    ls -lh "$EMB_DIR/q_${q}.parquet" 2>/dev/null || echo "    MISSING q_${q}"
 done
 
 echo ""
