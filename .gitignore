@@ -15,6 +15,7 @@ logs/
 report/
 embeddings_v2/
 embeddings_weighted/
-mixture_fits_*.rdsmodels_v2/
+mixture_fits_*.rds
+models_v2/
 models_weighted/
 report_*/
