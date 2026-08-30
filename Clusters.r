@@ -29,36 +29,185 @@ library(flexmix)
 library(circlus)
 
 # ------------------------------ CONFIG ---------------------------------------
-QUARTER   <- "2019-10-01"
-EMB_FILE  <- sprintf("embeddings/q_%s.parquet", QUARTER)
+QUARTER   <- "2026-03-31"      # most recent quarter in the regenerated panel
+
+# Which embedding arm to interpret:
+#   "baseline" = unweighted mean pooling, the replication of Gabaix et al.
+#   "weighted" = the extension, positions weighted by portfolio share
+# The two arms use different file-name conventions because the weighted
+# training script encodes its variant in the name.
+ARM <- "weighted"
+
+EMB_FILE <- switch(
+  ARM,
+  baseline = sprintf("embeddings_v2/q_%s.parquet", QUARTER),
+  weighted = sprintf("embeddings_weighted/q_%s__weighted_first-chunk.parquet",
+                     QUARTER),
+  stop("ARM must be 'baseline' or 'weighted'"))
+
 DATA_FILE <- sprintf("data/q_%s.parquet", QUARTER)
 INV_REF   <- "reference/investors_master.parquet"
 SEC_REF   <- "reference/securities_master.parquet"
+
+# The BIC sweep is the only slow step (11 EM fits). Cache it so that
+# re-running to tweak a lens costs seconds rather than half an hour.
+# ---- Geography restriction ------------------------------------------------
+# The asset-embeddings paper restricts its universe to US equities (via a
+# merge with CRSP) BEFORE training, so non-US securities are never tokenised
+# and the encoder never sees them. That design cannot be reproduced here
+# without regenerating the sequences and retraining: these embeddings were
+# learned on a global universe.
+#
+# US_ONLY does something related but weaker, and post-hoc. Investors whose
+# books are predominantly US are selected, and the mixture is re-fitted on
+# that subset alone. Cross-investor geographic variation is thereby removed
+# from the CLUSTERING even though it remains present in the REPRESENTATION.
+# The question it answers is: once geography is held roughly fixed, what
+# organises the remaining investors?
+US_ONLY      <- TRUE   # TRUE = cluster only predominantly-US investors
+US_THRESHOLD <- 0.90    # min share of an investor's positions in US issuers
+
+SUFFIX    <- if (US_ONLY) sprintf("_us%02d", round(100 * US_THRESHOLD)) else ""
+FIT_CACHE <- sprintf("mixture_fits_%s_%s%s.rds", ARM, QUARTER, SUFFIX)
+OUT_TAG   <- sprintf("%s_%s%s", ARM, QUARTER, SUFFIX)
 
 K_GRID    <- 2:12       # k values tried in the BIC sweep
 K_FINAL   <- NA         # NA = take the BIC winner; or set a number yourself
 SEED      <- 42
 MINPRIOR  <- 0.01       # smallest allowed cluster share (~1% of investors)
+MIN_COMP  <- 150        # ...but never fewer than this many investors,
+                        # which keeps components from collapsing on
+                        # small subsets such as the US-only run
 MIN_SHARE <- 0.10       # issuer must be held by >=10% of a cluster to be shown
 
 # ========================= 1. LOAD + CLUSTER =================================
+cat(sprintf("Quarter: %s | arm: %s | universe: %s\nEmbeddings: %s\n",
+            QUARTER, ARM,
+            if (US_ONLY) sprintf("US-only (>=%.0f%% US positions)", 100*US_THRESHOLD)
+            else "global", EMB_FILE))
+stopifnot(file.exists(EMB_FILE), file.exists(DATA_FILE))
 df <- read_parquet(EMB_FILE)
 X  <- as.matrix(df[, grepl("^dim_", names(df))])
 X  <- X / sqrt(rowSums(X^2))                 # unit length (cosine geometry)
 meta <- df |> select(investor_id, quarter_end, investor_type)
 
-sweep <- data.frame(); fits <- list()
-for (k in K_GRID) {
-  set.seed(SEED)
-  fit <- flexmix(X ~ 1, k = k, model = FLXMCspcauchy(),
-                 control = list(minprior = MINPRIOR))
-  fits[[as.character(k)]] <- fit
-  sweep <- rbind(sweep, data.frame(k_asked = k,
-                                   k_kept  = length(unique(clusters(fit))),
-                                   logLik  = as.numeric(logLik(fit)),
-                                   BIC     = BIC(fit)))
-  cat(sprintf("k=%2d -> kept %d components, BIC = %.0f\n",
-              k, tail(sweep$k_kept, 1), tail(sweep$BIC, 1)))
+# ---- holdings, loaded here because the US filter needs them before the fit --
+sec_ref <- read_parquet(SEC_REF) |>
+  select(issuer_id, any_of(c(
+    "entity_proper_name", "iso_country", "country_desc", "region_code",
+    "sector_code", "factset_industry_desc", "factset_sector_code",
+    "cap_group", "market_cap", "l2_id", "n_holders_total")))
+
+seqs_all <- read_parquet(DATA_FILE) |>
+  semi_join(meta, by = "investor_id")
+
+# Top-62 chunk per investor. Data_Cleaning.r writes an explicit chunk_id
+# (1 = top of the book), so this is a filter rather than an inference;
+# slice_head() would depend on file row order.
+seqs <- if ("chunk_id" %in% names(seqs_all)) {
+  seqs_all |> filter(chunk_id == 1)
+} else {
+  warning("no chunk_id column; falling back to file row order")
+  seqs_all |> group_by(investor_id) |> slice_head(n = 1) |> ungroup()
+}
+stopifnot(nrow(seqs) == n_distinct(seqs_all$investor_id))
+
+long_base <- seqs |>
+  mutate(pos = map(tokens, ~ tibble(issuer_id = as.character(.x),
+                                    rank = seq_along(.x)))) |>
+  select(investor_id, n_assets_full, pos) |>
+  unnest(pos) |>
+  left_join(sec_ref, by = "issuer_id")
+
+# ---- optional restriction to predominantly-US investors -------------------
+us_share <- long_base |>
+  group_by(investor_id) |>
+  summarise(n_known = sum(!is.na(iso_country)),
+            pct_us  = mean(iso_country == "US", na.rm = TRUE),
+            .groups = "drop") |>
+  # an investor whose holdings all have unknown domicile yields NaN from the
+  # mean of an empty set; such investors cannot be shown to be US-focused, so
+  # they are treated as 0 and counted separately rather than silently dropped
+  mutate(pct_us = if_else(n_known == 0, 0, pct_us))
+
+n_nocountry <- sum(us_share$n_known == 0)
+if (n_nocountry > 0)
+  cat(sprintf("\n[note] %s investor(s) have no issuer with a known domicile; ",
+              format(n_nocountry, big.mark = ",")),
+      "treated as non-US.\n", sep = "")
+
+# how many investors would survive at various thresholds - printed always,
+# so the choice of US_THRESHOLD can be made from the data rather than guessed
+cat("\nInvestors by US share of positions:\n")
+for (thr in c(0.50, 0.75, 0.90, 0.95, 0.99)) {
+  cat(sprintf("  >= %3.0f%% US : %6s investors (%4.1f%%)\n", 100 * thr,
+              format(sum(us_share$pct_us >= thr, na.rm = TRUE), big.mark = ","),
+              100 * mean(us_share$pct_us >= thr, na.rm = TRUE)))
+}
+
+if (US_ONLY) {
+  keep <- us_share |> filter(pct_us >= US_THRESHOLD) |> pull(investor_id)
+  cat(sprintf(paste0(
+    "\nUS-ONLY restriction at %.0f%%: %s of %s investors retained (%.1f%%)\n",
+    "  median US share among retained: %.3f | among dropped: %.3f\n"),
+    100 * US_THRESHOLD,
+    format(length(keep), big.mark = ","),
+    format(nrow(meta), big.mark = ","),
+    100 * length(keep) / nrow(meta),
+    median(us_share$pct_us[us_share$investor_id %in% keep], na.rm = TRUE),
+    median(us_share$pct_us[!us_share$investor_id %in% keep], na.rm = TRUE)))
+  if (length(keep) < 500)
+    stop("too few investors survive the US filter; lower US_THRESHOLD")
+
+  idx  <- meta$investor_id %in% keep
+  X    <- X[idx, , drop = FALSE]
+  meta <- meta[idx, ]
+  long_base <- long_base |> filter(investor_id %in% keep)
+  cat(sprintf("  clustering %s investors, %s positions\n",
+              format(nrow(meta), big.mark = ","),
+              format(nrow(long_base), big.mark = ",")))
+}
+
+if (file.exists(FIT_CACHE)) {
+  cat(sprintf("Loading cached mixture fits from %s\n", FIT_CACHE))
+  cached <- readRDS(FIT_CACHE)
+  fits <- cached$fits; sweep <- cached$sweep
+  print(sweep)
+} else {
+  # minprior is a SHARE, so on a smaller sample it permits smaller components
+  # in absolute terms. Components of a few dozen investors readily collapse
+  # (rho -> 1) and return a non-finite likelihood, which aborts the sweep.
+  # The floor is therefore raised until it admits at least MIN_COMP investors.
+  eff_minprior <- max(MINPRIOR, MIN_COMP / nrow(X))
+  if (eff_minprior > MINPRIOR)
+    cat(sprintf("\n[note] minprior raised from %.3f to %.3f so that the ",
+                MINPRIOR, eff_minprior),
+        sprintf("smallest admissible component holds >= %d investors\n", MIN_COMP),
+        sep = "")
+
+  sweep <- data.frame(); fits <- list()
+  for (k in K_GRID) {
+    set.seed(SEED)
+    # a degenerate component makes the likelihood non-finite and throws; that
+    # k is skipped rather than aborting the whole sweep
+    fit <- try(flexmix(X ~ 1, k = k, model = FLXMCspcauchy(),
+                       control = list(minprior = eff_minprior)),
+               silent = TRUE)
+    if (inherits(fit, "try-error") || !is.finite(as.numeric(logLik(fit)))) {
+      cat(sprintf("k=%2d -> FAILED (degenerate component); skipped\n", k))
+      next
+    }
+    fits[[as.character(k)]] <- fit
+    sweep <- rbind(sweep, data.frame(k_asked = k,
+                                     k_kept  = length(unique(clusters(fit))),
+                                     logLik  = as.numeric(logLik(fit)),
+                                     BIC     = BIC(fit)))
+    cat(sprintf("k=%2d -> kept %d components, BIC = %.0f\n",
+                k, tail(sweep$k_kept, 1), tail(sweep$BIC, 1)))
+  }
+  if (!nrow(sweep)) stop("every k failed; raise MIN_COMP or shorten K_GRID")
+  saveRDS(list(fits = fits, sweep = sweep), FIT_CACHE)
+  cat(sprintf("Cached mixture fits -> %s\n", FIT_CACHE))
 }
 best_k <- sweep$k_asked[which.min(sweep$BIC)]
 cat(sprintf("\nBIC selects k = %d%s\n", best_k,
@@ -85,31 +234,19 @@ inv_ref <- read_parquet(INV_REF) |>
     "invt_obj_code", "invt_obj_region_code", "invt_obj_country_code",
     "invt_obj_specialization_code", "invt_obj_asset_type_code")))
 
-sec_ref <- read_parquet(SEC_REF) |>
-  select(issuer_id, any_of(c(
-    "entity_proper_name", "iso_country", "country_desc", "region_code",
-    "sector_code", "factset_industry_desc", "factset_sector_code",
-    "cap_group", "market_cap", "l2_id", "n_holders_total")))
-
 inv <- cl_df |> left_join(meta, by = "investor_id") |>
                 left_join(inv_ref, by = "investor_id")
 
+# The reference tables were built from an earlier panel. Investors and
+# issuers that appear only in newer quarters will not be in them, which
+# shows up as reduced coverage rather than an error. Re-run Investor_data.r
+# if coverage here is materially below the ~99% seen for 2019-Q3.
 cat(sprintf("\nReference join: %.1f%% of investors matched, %.1f%% have a style\n",
             100 * mean(!is.na(inv$fund_type) | !is.na(inv$style_any)),
             100 * mean(!is.na(inv$style_any))))
 
-# holdings, one row per (investor, issuer, rank), with issuer attributes
-seqs <- read_parquet(DATA_FILE) |>
-  semi_join(cl_df, by = "investor_id") |>
-  group_by(investor_id) |> slice_head(n = 1) |> ungroup()   # top-62 chunk
-
-long <- seqs |>
-  mutate(pos = map(tokens, ~ tibble(issuer_id = as.character(.x),
-                                    rank = seq_along(.x)))) |>
-  select(investor_id, n_assets_full, pos) |>
-  unnest(pos) |>
-  inner_join(cl_df, by = "investor_id") |>
-  left_join(sec_ref, by = "issuer_id")
+# holdings with cluster labels attached
+long <- long_base |> inner_join(cl_df, by = "investor_id")
 
 cat(sprintf("Holdings: %s positions | %.1f%% of issuers named\n",
             format(nrow(long), big.mark = ","),
@@ -351,6 +488,12 @@ assoc <- bind_rows(
 cat("\n=== Attributes ranked by how strongly they explain cluster membership ===\n")
 print(assoc, n = Inf)
 
+if (US_ONLY) {
+  cat("\nNote: under the US-only restriction, geography attributes have little\n",
+      "remaining variance by construction, so their scores are not comparable\n",
+      "to the unrestricted run. Compare the ORDERING of the other families.\n")
+}
+
 cat("\n=== Rolled up by family (max strength within family) ===\n")
 print(assoc |> group_by(family) |>
         summarise(best_attribute = attribute[which.max(strength)],
@@ -363,7 +506,9 @@ cat("\nIf geography / artifact / vehicle outrank strategy, the clusters are\n",
 saveRDS(list(cluster = cl_df, k = K_FINAL, rho = rho, sweep = sweep,
              posterior = posterior(spc), seed = SEED, quarter = QUARTER,
              style_tab = style_tab, distinctive = distinctive, assoc = assoc),
-        sprintf("cluster_assignment_%s.rds", QUARTER))
-write.csv(assoc,       "cluster_association_ranking.csv", row.names = FALSE)
-write.csv(distinctive, "cluster_distinctive_holdings.csv", row.names = FALSE)
-cat("\nSaved: cluster_assignment_<quarter>.rds + 2 csv files\n")
+        sprintf("cluster_assignment_%s.rds", OUT_TAG))
+write.csv(assoc, sprintf("cluster_association_ranking_%s.csv", OUT_TAG),
+          row.names = FALSE)
+write.csv(distinctive, sprintf("cluster_distinctive_holdings_%s.csv", OUT_TAG),
+          row.names = FALSE)
+cat(sprintf("\nSaved: cluster_assignment_%s.rds + 2 csv files\n", OUT_TAG))
