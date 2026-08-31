@@ -887,6 +887,10 @@ def main():
         print(f"No q_*.parquet files found in {cfg['seq_dir']}")
         return
 
+    # detect real weights once, up front, so the variant tag is stable
+    import pyarrow.parquet as pq
+    cfg["_real_weights"] = cfg["weight_col"] in pq.read_schema(files[0]).names
+
     # ---- restrict to the requested quarters ------------------------------
     def label(p):
         return p.stem.replace("q_", "")
