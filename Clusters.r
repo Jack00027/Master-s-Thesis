@@ -15,7 +15,8 @@
 #      are these clusters STRATEGY or SEGMENTATION?
 #
 # Inputs
-#   embeddings/q_<date>.parquet           investor embeddings
+#   embeddings_weighted/q_<date>__weighted_paper.parquet   (weighted arm)
+#   embeddings_v2/q_<date>__mean_paper.parquet             (baseline arm)
 #   data/q_<date>.parquet                 token sequences
 #   reference/investors_master.parquet    investor attributes  (Investor_data.r)
 #   reference/securities_master.parquet   issuer attributes    (Investor_data.r)
@@ -27,6 +28,22 @@
 #   renamed inv_* on read so the two can never be confused. The per-investor
 #   counterparts of issuer geography are computed explicitly from holdings:
 #   pct_us (continuous) and modal_issuer_country (categorical).
+#
+# NOTE ON THE HOLDINGS SLICE  (changed)
+#   The holdings view must be the SAME slice of the book the encoder saw,
+#   or every characterisation below describes a different portfolio from
+#   the one that produced the embedding.
+#
+#   Data_Cleaning.r chunks a portfolio into k = ceil(n/62) EQUAL-size chunks
+#   of ceil(n/k) positions, so chunk 1 is usually SHORTER than 62:
+#       n = 63  -> 32, 31           n = 125 -> 42, 42, 41
+#       n = 100 -> 50, 50           n = 187 -> 47, 47, 47, 46
+#   Filtering chunk_id == 1 therefore does NOT give the top 62; it gives a
+#   variable-length prefix, median ~47 positions on recent quarters.
+#
+#   The training script's --coverage paper joins the chunks and takes the
+#   largest CONTEXT_WINDOW positions, per Gabaix et al. This script now does
+#   the same, which affects the US filter, all of Lens C, and inv_feat.
 # =============================================================================
 
 library(arrow)
@@ -39,26 +56,36 @@ library(circlus)
 # ------------------------------ CONFIG ---------------------------------------
 QUARTER   <- "2026-03-31"      # most recent quarter in the regenerated panel
 
+# Must match --context-window in the training run that produced EMB_FILE.
+CONTEXT_WINDOW <- 62
+
 # Which embedding arm to interpret:
 #   "baseline" = unweighted mean pooling, the replication of Gabaix et al.
 #   "weighted" = the extension, positions weighted by portfolio share
-# The two arms use different file-name conventions because the weighted
-# training script encodes its variant in the name.
+# Both arms now come from BERT_training_weighted.py with --coverage paper and
+# differ in --pooling alone, so the comparison isolates the pooling effect.
 ARM <- "weighted"
 
 EMB_FILE <- switch(
   ARM,
-  baseline = sprintf("embeddings_v2/q_%s.parquet", QUARTER),
-  weighted = sprintf("embeddings_weighted/q_%s__weighted_first-chunk.parquet",
+  baseline = sprintf("embeddings_v2/q_%s__mean_paper.parquet", QUARTER),
+  weighted = sprintf("embeddings_weighted/q_%s__weighted_paper.parquet",
                      QUARTER),
   stop("ARM must be 'baseline' or 'weighted'"))
+
+# Superseded files from the pre-correction runs. They are still on disk and
+# would load without complaint, so name them explicitly rather than letting a
+# stale path go unnoticed.
+LEGACY_FILE <- switch(
+  ARM,
+  baseline = sprintf("embeddings_v2/q_%s.parquet", QUARTER),
+  weighted = sprintf("embeddings_weighted/q_%s__weighted_first-chunk.parquet",
+                     QUARTER))
 
 DATA_FILE <- sprintf("data/q_%s.parquet", QUARTER)
 INV_REF   <- "reference/investors_master.parquet"
 SEC_REF   <- "reference/securities_master.parquet"
 
-# The BIC sweep is the only slow step (11 EM fits). Cache it so that
-# re-running to tweak a lens costs seconds rather than half an hour.
 # ---- Geography restriction ------------------------------------------------
 # The asset-embeddings paper restricts its universe to US equities (via a
 # merge with CRSP) BEFORE training, so non-US securities are never tokenised
@@ -75,13 +102,32 @@ SEC_REF   <- "reference/securities_master.parquet"
 #
 # The share is computed over positions whose issuer has a known domicile, so
 # it is a share of IDENTIFIED holdings; issuers missing from the security
-# reference table are excluded from both numerator and denominator.
+# reference table are excluded from both numerator and denominator. It is
+# computed on the top-CONTEXT_WINDOW slice, i.e. the same positions the
+# encoder saw, not on the whole book.
 US_ONLY      <- TRUE   # TRUE = cluster only predominantly-US investors
 US_THRESHOLD <- 0.90    # min share of an investor's positions in US issuers
 
+# Weight the Lens C / inv_feat tables by portfolio share instead of counting
+# each position once. This FOLLOWS THE ARM: mean pooling treats every position
+# in the window equally, so equal-count tables are its coherent counterpart;
+# weighted pooling does not, so counting a 0.01% position the same as a 5% one
+# would describe a portfolio the encoder never read. Override only to run the
+# cross-check.
+WEIGHT_HOLDINGS <- (ARM == "weighted")
+
+# The US filter deliberately stays UNWEIGHTED in both arms. It defines the
+# clustering universe, and the two arms must cluster the same investors for
+# the between-arm ARI to mean anything. Weighting it would retain a different
+# subset per arm and confound the comparison.
+
+# Holdings weighting affects the descriptive tables only, never the mixture,
+# so it stays out of FIT_CACHE and OUT_TAG: the fit is reusable across modes
+# and downstream scripts keep finding cluster_assignment_<arm>_<quarter>_us90.
 SUFFIX    <- if (US_ONLY) sprintf("_us%02d", round(100 * US_THRESHOLD)) else ""
 FIT_CACHE <- sprintf("mixture_fits_%s_%s%s.rds", ARM, QUARTER, SUFFIX)
 OUT_TAG   <- sprintf("%s_%s%s", ARM, QUARTER, SUFFIX)
+TAB_TAG   <- paste0(OUT_TAG, if (WEIGHT_HOLDINGS) "_wh" else "")
 
 K_GRID    <- 2:12       # k values tried in the BIC sweep
 K_FINAL   <- NA         # NA = take the BIC winner; or set a number yourself
@@ -97,7 +143,18 @@ cat(sprintf("Quarter: %s | arm: %s | universe: %s\nEmbeddings: %s\n",
             QUARTER, ARM,
             if (US_ONLY) sprintf("US-only (>=%.0f%% US positions)", 100*US_THRESHOLD)
             else "global", EMB_FILE))
-stopifnot(file.exists(EMB_FILE), file.exists(DATA_FILE))
+
+if (!file.exists(EMB_FILE)) {
+  msg <- sprintf("embedding file not found: %s", EMB_FILE)
+  if (file.exists(LEGACY_FILE))
+    msg <- paste0(msg, "\n  The pre-correction file ", LEGACY_FILE,
+                  " does exist. It was built with --coverage first-chunk and",
+                  "\n  is NOT the paper's top-", CONTEXT_WINDOW,
+                  " slice. Re-run 05_train_all.sh rather than pointing here.")
+  stop(msg)
+}
+stopifnot(file.exists(DATA_FILE))
+
 df <- read_parquet(EMB_FILE)
 X  <- as.matrix(df[, grepl("^dim_", names(df))])
 X  <- X / sqrt(rowSums(X^2))                 # unit length (cosine geometry)
@@ -114,23 +171,53 @@ sec_ref <- read_parquet(SEC_REF) |>
 seqs_all <- read_parquet(DATA_FILE) |>
   semi_join(meta, by = "investor_id")
 
-# Top-62 chunk per investor. Data_Cleaning.r writes an explicit chunk_id
-# (1 = top of the book), so this is a filter rather than an inference;
-# slice_head() would depend on file row order.
-seqs <- if ("chunk_id" %in% names(seqs_all)) {
-  seqs_all |> filter(chunk_id == 1)
-} else {
-  warning("no chunk_id column; falling back to file row order")
-  seqs_all |> group_by(investor_id) |> slice_head(n = 1) |> ungroup()
-}
-stopifnot(nrow(seqs) == n_distinct(seqs_all$investor_id))
+if (!"chunk_id" %in% names(seqs_all))
+  stop("no chunk_id column in ", DATA_FILE,
+       "; regenerate it with the current Data_Cleaning.r, since chunk order ",
+       "cannot be recovered from row order reliably")
 
-long_base <- seqs |>
-  mutate(pos = map(tokens, ~ tibble(issuer_id = as.character(.x),
-                                    rank = seq_along(.x)))) |>
+has_weights <- "weights" %in% names(seqs_all)
+if (WEIGHT_HOLDINGS && !has_weights)
+  stop("WEIGHT_HOLDINGS is TRUE but ", DATA_FILE, " has no `weights` column")
+
+# ---- top-CONTEXT_WINDOW positions, joined ACROSS chunks ---------------------
+# This is the slice --coverage paper feeds the encoder. Chunks are unnested
+# in chunk_id order and ranked globally, so rank 63 continues from chunk 1
+# into chunk 2 rather than restarting.
+long_base <- seqs_all |>
+  arrange(investor_id, chunk_id) |>
+  mutate(pos = if (has_weights)
+                 map2(tokens, weights,
+                      ~ tibble(issuer_id = as.character(.x), w = as.numeric(.y)))
+               else
+                 map(tokens, ~ tibble(issuer_id = as.character(.x), w = NA_real_))) |>
   select(investor_id, n_assets_full, pos) |>
   unnest(pos) |>
+  group_by(investor_id) |>
+  mutate(rank = row_number()) |>
+  filter(rank <= CONTEXT_WINDOW) |>
+  ungroup() |>
   left_join(sec_ref, by = "issuer_id")
+
+# How much this differs from the old chunk_id == 1 slice, printed so the
+# change is visible rather than assumed.
+chunk1_len <- seqs_all |> filter(chunk_id == 1) |>
+  transmute(investor_id, n1 = map_int(tokens, length))
+top_len <- long_base |> count(investor_id, name = "ntop")
+cmp <- inner_join(chunk1_len, top_len, by = "investor_id")
+n_short <- sum(cmp$n1 < cmp$ntop)
+cat(sprintf(paste0(
+  "\nHoldings slice: top %d positions joined across chunks.\n",
+  "  chunk 1 alone would have been shorter for %s of %s investors ",
+  "(median %d vs %d)\n"),
+  CONTEXT_WINDOW,
+  format(n_short, big.mark = ","), format(nrow(cmp), big.mark = ","),
+  if (n_short) as.integer(median(cmp$n1[cmp$n1 < cmp$ntop])) else 0L,
+  CONTEXT_WINDOW))
+
+# position weight used by the holdings tables; 1 = count each position once
+long_base <- long_base |>
+  mutate(wt = if (WEIGHT_HOLDINGS) w else 1)
 
 # ---- optional restriction to predominantly-US investors -------------------
 us_share <- long_base |>
@@ -269,19 +356,25 @@ cat(sprintf("\nReference join: %.1f%% of investors matched, %.1f%% have a style\
 # holdings with cluster labels attached
 long <- long_base |> inner_join(cl_df, by = "investor_id")
 
-cat(sprintf("Holdings: %s positions | %.1f%% of issuers named\n",
+cat(sprintf("Holdings: %s positions | %.1f%% of issuers named | weighting: %s\n",
             format(nrow(long), big.mark = ","),
-            100 * mean(!is.na(long$entity_proper_name))))
+            100 * mean(!is.na(long$entity_proper_name)),
+            if (WEIGHT_HOLDINGS) "portfolio share" else "equal per position"))
 
 # ---- helpers ----------------------------------------------------------------
 # lift = share within cluster / share overall. >1 over-represented.
+# `wt` is 1 unless WEIGHT_HOLDINGS, in which case shares are of portfolio
+# weight rather than of position count. min_n stays a COUNT either way, so the
+# support threshold means the same thing in both modes.
 lift_table <- function(data, var, min_n = 20, top = 3) {
   var <- rlang::ensym(var)
-  overall <- data |> filter(!is.na(!!var)) |>
-    count(!!var) |> mutate(p_all = n / sum(n)) |> select(-n)
-  data |> filter(!is.na(!!var)) |>
-    count(cluster, !!var) |>
-    group_by(cluster) |> mutate(p_cl = n / sum(n)) |> ungroup() |>
+  d <- data |> filter(!is.na(!!var))
+  overall <- d |> group_by(!!var) |>
+    summarise(w_all = sum(wt), .groups = "drop") |>
+    mutate(p_all = w_all / sum(w_all)) |> select(-w_all)
+  d |> group_by(cluster, !!var) |>
+    summarise(n = n(), w_cl = sum(wt), .groups = "drop") |>
+    group_by(cluster) |> mutate(p_cl = w_cl / sum(w_cl)) |> ungroup() |>
     left_join(overall, by = rlang::as_string(var)) |>
     mutate(lift = round(p_cl / p_all, 2),
            pct  = round(100 * p_cl, 1)) |>
@@ -294,13 +387,18 @@ lift_table <- function(data, var, min_n = 20, top = 3) {
 top_share <- function(data, var, label) {
   var <- rlang::ensym(var)
   data |> filter(!is.na(!!var)) |>
-    count(cluster, !!var) |>
+    group_by(cluster, !!var) |>
+    summarise(w = sum(wt), .groups = "drop") |>
     group_by(cluster) |>
-    mutate(pct = 100 * n / sum(n)) |>
+    mutate(pct = 100 * w / sum(w)) |>
     slice_max(pct, n = 1, with_ties = FALSE) |>
     ungroup() |>
     transmute(cluster, !!label := as.character(!!var), pct = round(pct, 1))
 }
+
+# `inv` is one row per investor and has no wt column; give it one so the
+# helpers above work unchanged on investor-level tables.
+inv$wt <- 1
 
 # ========================= 3A. LENS A — WHO ==================================
 cat("\n\n############ LENS A — WHO IS IN EACH CLUSTER ############\n")
@@ -355,7 +453,9 @@ print(inv |>
                   .groups = "drop"), n = Inf, width = Inf)
 
 cat("\n=== Size and breadth ===\n")
-breadth <- seqs |> distinct(investor_id, n_assets_full) |>
+# n_assets_full is the WHOLE book, not the top-CONTEXT_WINDOW slice, so
+# pct_over_62 reports how many investors have a book the encoder truncated.
+breadth <- seqs_all |> distinct(investor_id, n_assets_full) |>
   inner_join(cl_df, by = "investor_id")
 print(inv |>
         group_by(cluster) |>
@@ -364,12 +464,14 @@ print(inv |>
                   .groups = "drop") |>
         left_join(breadth |> group_by(cluster) |>
                     summarise(med_assets = median(n_assets_full),
-                              pct_over_62 = round(100 * mean(n_assets_full > 62), 1),
+                              pct_truncated = round(
+                                100 * mean(n_assets_full > CONTEXT_WINDOW), 1),
                               .groups = "drop"), by = "cluster"), n = Inf)
 
 # ========================= 3C. LENS C — WHAT THEY HOLD =======================
-# Everything below operates on `long`, which is holdings joined to sec_ref, so
-# country_desc / iso_country / region_code here are the ISSUER's.
+# Everything below operates on `long`, which is the top-CONTEXT_WINDOW slice
+# joined to sec_ref, so country_desc / iso_country / region_code here are the
+# ISSUER's, and the positions are the ones the encoder actually read.
 cat("\n\n############ LENS C — WHAT THEY HOLD (segmentation checks) ############\n")
 
 cat("\n=== Issuer country: top country per cluster ===\n")
@@ -380,9 +482,10 @@ print(lift_table(long, country_desc, min_n = 50, top = 3), n = Inf)
 
 cat("\n=== Issuer region mix (% of positions) ===\n")
 print(long |> filter(!is.na(region_code)) |>
-        count(cluster, region_code) |>
-        group_by(cluster) |> mutate(pct = round(100 * n / sum(n), 1)) |>
-        ungroup() |> select(-n) |>
+        group_by(cluster, region_code) |>
+        summarise(w = sum(wt), .groups = "drop") |>
+        group_by(cluster) |> mutate(pct = round(100 * w / sum(w), 1)) |>
+        ungroup() |> select(-w) |>
         pivot_wider(names_from = region_code, values_from = pct, values_fill = 0),
       n = Inf, width = Inf)
 
@@ -391,9 +494,10 @@ print(lift_table(long, factset_industry_desc, min_n = 50, top = 3), n = Inf)
 
 cat("\n=== Market-cap group mix (% of positions) ===\n")
 print(long |> filter(!is.na(cap_group)) |>
-        count(cluster, cap_group) |>
-        group_by(cluster) |> mutate(pct = round(100 * n / sum(n), 1)) |>
-        ungroup() |> select(-n) |>
+        group_by(cluster, cap_group) |>
+        summarise(w = sum(wt), .groups = "drop") |>
+        group_by(cluster) |> mutate(pct = round(100 * w / sum(w), 1)) |>
+        ungroup() |> select(-w) |>
         pivot_wider(names_from = cap_group, values_from = pct, values_fill = 0),
       n = Inf, width = Inf)
 
@@ -403,7 +507,8 @@ print(long |> group_by(cluster) |>
                   pct_known = round(100 * mean(!is.na(market_cap)), 1),
                   .groups = "drop"), n = Inf)
 
-# distinctive issuers, WITH NAMES
+# distinctive issuers, WITH NAMES. Counted per investor (does the investor
+# hold it at all), so this one is deliberately unweighted in both modes.
 n_by_cl  <- long |> distinct(investor_id, cluster) |> count(cluster, name = "n_cl")
 held_all <- long |> distinct(investor_id, issuer_id) |>
   count(issuer_id, name = "n_all") |>
@@ -477,10 +582,11 @@ eta_sq <- function(x, g) {
 }
 
 # Investor-level features. Everything computed in the summarise() below is a
-# per-investor summary of the HOLDINGS; everything arriving through the join
-# with `inv` is an attribute of the INVESTOR. Note that summarise() keeps only
-# the columns it names, so issuer geography reaches this table only via
-# pct_us and modal_issuer_country - hence both are constructed explicitly.
+# per-investor summary of the HOLDINGS (top-CONTEXT_WINDOW slice); everything
+# arriving through the join with `inv` is an attribute of the INVESTOR. Note
+# that summarise() keeps only the columns it names, so issuer geography
+# reaches this table only via pct_us and modal_issuer_country - hence both
+# are constructed explicitly.
 inv_feat <- long |>
   group_by(investor_id) |>
   summarise(pct_us      = mean(iso_country == "US", na.rm = TRUE),
@@ -553,10 +659,13 @@ cat("\nIf geography / artifact / vehicle outrank strategy, the clusters are\n",
 # ========================= 5. SAVE ===========================================
 saveRDS(list(cluster = cl_df, k = K_FINAL, rho = rho, sweep = sweep,
              posterior = posterior(spc), seed = SEED, quarter = QUARTER,
+             arm = ARM, emb_file = EMB_FILE,
+             context_window = CONTEXT_WINDOW, weight_holdings = WEIGHT_HOLDINGS,
              style_tab = style_tab, distinctive = distinctive, assoc = assoc),
         sprintf("cluster_assignment_%s.rds", OUT_TAG))
-write.csv(assoc, sprintf("cluster_association_ranking_%s.csv", OUT_TAG),
+write.csv(assoc, sprintf("cluster_association_ranking_%s.csv", TAB_TAG),
           row.names = FALSE)
-write.csv(distinctive, sprintf("cluster_distinctive_holdings_%s.csv", OUT_TAG),
+write.csv(distinctive, sprintf("cluster_distinctive_holdings_%s.csv", TAB_TAG),
           row.names = FALSE)
-cat(sprintf("\nSaved: cluster_assignment_%s.rds + 2 csv files\n", OUT_TAG))
+cat(sprintf("\nSaved: cluster_assignment_%s.rds + 2 csv files (%s)\n",
+            OUT_TAG, TAB_TAG))

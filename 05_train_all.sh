@@ -18,6 +18,10 @@
 #   sbatch --export=ALL,ARM=weighted 05_train_all.sh      # weighted arm
 #   sbatch --export=ALL,ARM=base     05_train_all.sh      # replication arm
 #
+# sbatch propagates the submitting environment by default, so if --export
+# gives trouble (it has on this cluster's GPU nodes), this works too:
+#   ARM=base sbatch 05_train_all.sh
+#
 # ARM defaults to weighted, so a bare `sbatch 05_train_all.sh` runs the
 # weighted arm. Both arms can queue at once -- they write to different
 # directories and never touch the same file. The %4 throttle caps
@@ -47,10 +51,19 @@
 # slice on one side only, and the arm comparison would no longer isolate
 # the pooling effect.
 #
+# Output directories, one per arm:
+#   weighted -> embeddings_weighted/q_<quarter>__weighted_paper.parquet
+#   base     -> embeddings_v3/q_<quarter>__mean_paper.parquet
+#
+# embeddings_v3 is a NEW directory, deliberately not embeddings_v2. The v2
+# files came from BERT_training.py with the old chunks[0] extraction and are
+# not comparable with anything produced here; keeping them in a separate
+# directory means a stale path fails loudly instead of mixing arms.
+#
 # The output filenames carry the new variant tags, so nothing collides
 # with the superseded __weighted_first-chunk / unsuffixed files. Those
-# stay on disk; update the paths in Clusters.r and Cluster_Dynamics_v2.r
-# or they will keep reading the old ones.
+# stay on disk; the paths in Clusters.r and Cluster_Dynamics_v3.r must
+# point at the new directories or they will keep reading the old ones.
 # ---------------------------------------------------------------------
 #
 # Watch:   squeue -u $USER
@@ -73,8 +86,8 @@ case "$ARM" in
     SUFFIX="__weighted_paper"
     ;;
   base)
-    EMB_DIR="embeddings_v2"
-    MODEL_DIR="models_v2"
+    EMB_DIR="embeddings_v3"
+    MODEL_DIR="models_v3"
     EXTRA="--pooling mean --coverage paper"
     SUFFIX="__mean_paper"
     ;;
