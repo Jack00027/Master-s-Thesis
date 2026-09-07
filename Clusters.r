@@ -19,6 +19,14 @@
 #   data/q_<date>.parquet                 token sequences
 #   reference/investors_master.parquet    investor attributes  (Investor_data.r)
 #   reference/securities_master.parquet   issuer attributes    (Investor_data.r)
+#
+# NOTE ON GEOGRAPHY COLUMNS
+#   Both reference tables carry columns named country_desc / iso_country /
+#   region_code, meaning the ISSUER's domicile in securities_master and the
+#   INVESTOR's own domicile in investors_master. The investor-side columns are
+#   renamed inv_* on read so the two can never be confused. The per-investor
+#   counterparts of issuer geography are computed explicitly from holdings:
+#   pct_us (continuous) and modal_issuer_country (categorical).
 # =============================================================================
 
 library(arrow)
@@ -64,6 +72,10 @@ SEC_REF   <- "reference/securities_master.parquet"
 # from the CLUSTERING even though it remains present in the REPRESENTATION.
 # The question it answers is: once geography is held roughly fixed, what
 # organises the remaining investors?
+#
+# The share is computed over positions whose issuer has a known domicile, so
+# it is a share of IDENTIFIED holdings; issuers missing from the security
+# reference table are excluded from both numerator and denominator.
 US_ONLY      <- TRUE   # TRUE = cluster only predominantly-US investors
 US_THRESHOLD <- 0.90    # min share of an investor's positions in US issuers
 
@@ -92,6 +104,7 @@ X  <- X / sqrt(rowSums(X^2))                 # unit length (cosine geometry)
 meta <- df |> select(investor_id, quarter_end, investor_type)
 
 # ---- holdings, loaded here because the US filter needs them before the fit --
+# Geography columns here are the ISSUER's and keep their original names.
 sec_ref <- read_parquet(SEC_REF) |>
   select(issuer_id, any_of(c(
     "entity_proper_name", "iso_country", "country_desc", "region_code",
@@ -223,6 +236,11 @@ sizes <- cl_df |> count(cluster, name = "size") |> mutate(rho = round(rho, 3))
 cat("\n=== Cluster sizes and concentration ===\n"); print(sizes, n = Inf)
 
 # ========================= 2. ATTACH REFERENCE DATA ==========================
+# country_desc / iso_country / region_code exist in BOTH reference tables with
+# different meanings. Renaming the investor-side ones to inv_* prevents them
+# from being read as issuer geography further down, in particular in the
+# association ranking of section 4, where inv_feat draws its categorical
+# columns from `inv` rather than from the holdings.
 inv_ref <- read_parquet(INV_REF) |>
   select(investor_id, any_of(c(
     "fund_type", "fund_type_desc", "style_any", "turnover_any", "aum_any",
@@ -232,7 +250,10 @@ inv_ref <- read_parquet(INV_REF) |>
     "pe_ratio", "pb_ratio", "dividend_yield", "sales_growth",
     "price_momentum", "relative_strength", "beta",
     "invt_obj_code", "invt_obj_region_code", "invt_obj_country_code",
-    "invt_obj_specialization_code", "invt_obj_asset_type_code")))
+    "invt_obj_specialization_code", "invt_obj_asset_type_code"))) |>
+  rename(any_of(c(inv_iso_country  = "iso_country",
+                  inv_country_desc = "country_desc",
+                  inv_region_code  = "region_code")))
 
 inv <- cl_df |> left_join(meta, by = "investor_id") |>
                 left_join(inv_ref, by = "investor_id")
@@ -292,6 +313,15 @@ if ("fund_type_desc" %in% names(inv)) {
   print(lift_table(inv, fund_type_desc, top = 2), n = Inf)
 }
 
+# Investor domicile: where the FUND is registered, not where it invests.
+# Reported here so it is visibly distinct from the issuer geography of Lens C.
+if ("inv_country_desc" %in% names(inv)) {
+  cat("\n=== Investor domicile: largest per cluster ===\n")
+  print(top_share(inv, inv_country_desc, "top_inv_domicile"), n = Inf)
+  cat("\n=== Investor domicile (lift) ===\n")
+  print(lift_table(inv, inv_country_desc, top = 3), n = Inf)
+}
+
 # Style is now ~85% covered (own_ent_funds.style via Investor_data.r), so this
 # is a genuine external validation rather than the 2% corroboration it was.
 cat("\n=== Declared style: distribution within each cluster (rows = cluster) ===\n")
@@ -338,6 +368,8 @@ print(inv |>
                               .groups = "drop"), by = "cluster"), n = Inf)
 
 # ========================= 3C. LENS C — WHAT THEY HOLD =======================
+# Everything below operates on `long`, which is holdings joined to sec_ref, so
+# country_desc / iso_country / region_code here are the ISSUER's.
 cat("\n\n############ LENS C — WHAT THEY HOLD (segmentation checks) ############\n")
 
 cat("\n=== Issuer country: top country per cluster ===\n")
@@ -444,18 +476,29 @@ eta_sq <- function(x, g) {
   if (ss_tot == 0) return(NA_real_) else ss_b / ss_tot
 }
 
-# investor-level features, including holdings summaries aggregated per investor
+# Investor-level features. Everything computed in the summarise() below is a
+# per-investor summary of the HOLDINGS; everything arriving through the join
+# with `inv` is an attribute of the INVESTOR. Note that summarise() keeps only
+# the columns it names, so issuer geography reaches this table only via
+# pct_us and modal_issuer_country - hence both are constructed explicitly.
 inv_feat <- long |>
   group_by(investor_id) |>
   summarise(pct_us      = mean(iso_country == "US", na.rm = TRUE),
             pct_top_sec = {t <- table(factset_industry_desc); if (length(t)) max(t)/sum(t) else NA_real_},
             med_cap     = median(market_cap, na.rm = TRUE),
+            # categorical counterpart of pct_us: the single country in which
+            # the investor holds most of its identified positions
+            modal_issuer_country = {
+              t <- table(country_desc)
+              if (length(t)) names(t)[which.max(t)] else NA_character_
+            },
             .groups = "drop") |>
   right_join(inv, by = "investor_id") |>
   left_join(breadth |> select(investor_id, n_assets_full), by = "investor_id")
 
 cat_vars <- intersect(c("style_any", "turnover_any", "fund_type_desc",
-                        "investor_type", "country_desc",
+                        "investor_type",
+                        "inv_country_desc", "modal_issuer_country",
                         "mgr_entity_proper_name", "fs_ultimate_parent_entity_id",
                         "invt_obj_region_code", "invt_obj_specialization_code",
                         "invt_obj_asset_type_code"), names(inv_feat))
@@ -473,8 +516,9 @@ assoc <- bind_rows(
          coverage = map_dbl(num_vars, ~ mean(!is.na(inv_feat[[.x]]))))
 ) |>
   mutate(family = case_when(
-    attribute %in% c("country_desc", "pct_us", "invt_obj_region_code",
-                     "invt_obj_country_code")            ~ "geography",
+    attribute %in% c("inv_country_desc", "modal_issuer_country", "pct_us",
+                     "invt_obj_region_code",
+                     "invt_obj_country_code")             ~ "geography",
     attribute %in% c("pct_top_sec", "invt_obj_specialization_code") ~ "sector",
     attribute %in% c("med_cap", "aum_any")                ~ "size",
     attribute %in% c("mgr_entity_proper_name",
@@ -486,12 +530,16 @@ assoc <- bind_rows(
   arrange(desc(strength))
 
 cat("\n=== Attributes ranked by how strongly they explain cluster membership ===\n")
+cat("(inv_country_desc = where the fund is registered;",
+    "modal_issuer_country = where it invests)\n")
 print(assoc, n = Inf)
 
 if (US_ONLY) {
-  cat("\nNote: under the US-only restriction, geography attributes have little\n",
-      "remaining variance by construction, so their scores are not comparable\n",
-      "to the unrestricted run. Compare the ORDERING of the other families.\n")
+  cat("\nNote: under the US-only restriction the HOLDINGS-based geography\n",
+      "attributes (pct_us, modal_issuer_country) have little remaining\n",
+      "variance by construction, so their scores are not comparable to the\n",
+      "unrestricted run. Investor domicile still varies, since non-US funds\n",
+      "may run US books. Compare the ORDERING of the other families.\n", sep = "")
 }
 
 cat("\n=== Rolled up by family (max strength within family) ===\n")

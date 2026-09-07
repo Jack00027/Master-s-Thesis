@@ -19,14 +19,51 @@ original behaviour stays reproducible as a baseline:
          only a proxy. Say so in the thesis.
 
   2. COVERAGE (--coverage)
-       first-chunk   : embed only the top-62 positions   (original)
+       paper         : embed the LARGEST context_window positions, joined
+                       across chunks. This is what Gabaix et al. specify:
+                       "the average contextualized embedding for a given
+                       investor for the largest 62 positions".  (DEFAULT)
+       first-chunk   : embed chunk 1 only. LEGACY -- see the note below;
+                       chunk 1 is NOT the largest 62 positions.
        all-chunks    : embed EVERY chunk of a portfolio and aggregate
                        them into one investor vector, weighted by the
-                       chunk's share of total portfolio weight  (NEW)
+                       chunk's share of total portfolio weight
        full-sequence : re-join the chunks into the original ranked
                        portfolio and train/embed with a LONGER context
                        window (--context-window), so attention actually
-                       spans the whole book                      (NEW)
+                       spans the whole book
+
+WHY "paper" AND "first-chunk" DIFFER
+    Data_Cleaning.r chunks a portfolio into k = ceil(n / 62) chunks of
+    ceil(n / k) positions each -- EQUAL-size chunks, matching the paper.
+    Equal-size means chunk 1 is usually SHORTER than the context window:
+
+        n = 63  -> 2 chunks: 32, 31        chunk 1 holds 32 positions
+        n = 100 -> 2 chunks: 50, 50        chunk 1 holds 50 positions
+        n = 124 -> 2 chunks: 62, 62        chunk 1 holds 62 positions
+        n = 125 -> 3 chunks: 42, 42, 41    chunk 1 holds 42 positions
+        n = 187 -> 4 chunks: 47, 47, 47, 46
+
+    Chunk 1 reaches a full 62 only just below each multiple of 62, and for
+    very large books where ceil(n/k) happens to land on 62. So reading
+    chunks[0] pools over fewer positions than the paper for most
+    multi-chunk investors, worst immediately above each boundary.
+    "paper" joins the chunks and takes the top context_window, which is
+    the largest-62 sequence regardless of where the splits fell.
+
+    "first-chunk" is kept only so previously trained
+    q_*__weighted_first-chunk.parquet files remain reproducible. Do not
+    use it for new runs.
+
+CONTRASTIVE PAIRS
+    The paper splits the even and odd positions of a portfolio into two
+    halves "where each half contains up to 62 assets". 62 is the context
+    window, so the SOURCE being split is up to 2 * context_window
+    positions and each strided half lands at up to context_window.
+    pooling_sequences() implements that. The previous version sliced the
+    source at context_window, producing ~31-asset halves: half the
+    paper's, and a length mismatch with extraction, which pools a full
+    62-token sequence.
 
 Outputs go to SEPARATE folders from the baseline run, so the original
 embeddings/ and models/ are never touched and the two sets can be compared
@@ -35,14 +72,23 @@ side by side. Variant is also encoded in the filename:
   embeddings_weighted/q_YYYY-MM-DD__<variant>.parquet
   models_weighted/q_YYYY-MM-DD__<variant>/
 
-Reproducing the original run (for a like-for-like baseline in the new folder):
-  python BERT_training_weighted.py --pooling mean --coverage first-chunk
+Reproducing Gabaix et al. exactly (unweighted):
+  python BERT_training_weighted.py --pooling mean --coverage paper
+
+The extension (weighted pooling is then the ONLY deviation):
+  python BERT_training_weighted.py --pooling weighted --coverage paper
 
 Suggested comparison set (same seed, same data):
-  --pooling mean     --coverage first-chunk      # baseline
-  --pooling weighted --coverage first-chunk      # pooling effect alone
+  --pooling mean     --coverage paper            # replication baseline
+  --pooling weighted --coverage paper            # pooling effect alone
   --pooling weighted --coverage all-chunks       # + tail of the book
   --pooling weighted --coverage full-sequence --context-window 256
+
+NOTE: pooling_sequences() and training_sequences() no longer depend on
+coverage (outside full-sequence), so "paper", "first-chunk" and
+"all-chunks" train an IDENTICAL model for a given quarter and seed, and
+differ only inside compute_investor_embeddings(). Several readouts can
+therefore be extracted from one training run.
 """
 
 from __future__ import annotations
@@ -102,7 +148,7 @@ def default_config():
         "finetune_epochs":   3,
         # NEW: pooling and coverage
         "pooling":           "weighted",     # "mean" | "weighted"
-        "coverage":          "all-chunks",   # "first-chunk"|"all-chunks"|"full-sequence"
+        "coverage":          "paper",        # "paper"|"first-chunk"|"all-chunks"|"full-sequence"
         "weight_col":        "weights",      # real weights, if the parquet has them
         "weight_scheme":     "power",        # "power" | "zipf" | "exp" | "uniform"
         "weight_alpha":      0.75,           # decay strength (see rank_weights)
@@ -226,11 +272,16 @@ def rank_weights(n, scheme, alpha):
 def assemble_portfolios(df, cfg):
     """Turn the chunked sequence table into one record per investor.
 
-    The R pipeline splits portfolios longer than 62 positions into
-    consecutive chunks and now writes an explicit `chunk_id` (1 = top of
-    the book), so ordering is read rather than inferred. Older files
-    without the column fall back to file row order, which is what the
-    pipeline produced before `chunk_id` existed.
+    Data_Cleaning.r splits portfolios longer than context_window into
+    EQUAL-size chunks (k = ceil(n / 62) chunks of ceil(n / k) each) and
+    writes an explicit `chunk_id` (1 = top of the book), so ordering is
+    read rather than inferred. Older files without the column fall back
+    to file row order, which is what the pipeline produced before
+    `chunk_id` existed.
+
+    Because the chunks are equal-size rather than filled to 62, chunk 1 is
+    generally NOT the largest 62 positions -- see the module docstring.
+    Anything that wants the top 62 must join the chunks first.
 
     Chunk order matters here in a way it does not for the unweighted
     baseline: weights are normalised across the WHOLE portfolio, so a
@@ -300,11 +351,12 @@ def assemble_portfolios(df, cfg):
 def training_sequences(portfolios, cfg):
     """Sequences fed to MLM pretraining, per coverage mode.
 
-    first-chunk   : every chunk is still used for pretraining (as before);
-                    coverage only changes what gets EMBEDDED.
-    all-chunks    : same -- every chunk is a training sequence.
-    full-sequence : chunks are re-joined and truncated to the (larger)
-                    context window, so attention spans the whole book.
+    paper / first-chunk / all-chunks
+        Every chunk is a training sequence, exactly as in the paper --
+        coverage only changes what gets EMBEDDED, not what gets trained on.
+    full-sequence
+        Chunks are re-joined and truncated to the (larger) context window,
+        so attention spans the whole book.
     """
     seqs = []
     if cfg["coverage"] == "full-sequence":
@@ -324,23 +376,36 @@ def training_sequences(portfolios, cfg):
 def pooling_sequences(portfolios, cfg, stoi):
     """(token_ids, weights) pairs used for contrastive fine-tuning.
 
-    Fine-tuning must use the SAME pooling and coverage as extraction --
-    otherwise one geometry is trained and a different one is read out.
-    For all-chunks the first chunk is used for pairing (a portfolio's two
-    halves must fit one forward pass); the tail still shapes the encoder
-    through pretraining and enters the final embedding at extraction.
+    Gabaix et al.: "We split the even and odd positions of a portfolio to
+    construct portfolio pairs, where each half contains up to 62 assets."
+    62 is the context window, so the SOURCE being split is up to
+    2 * context_window positions; a strided even/odd split then puts each
+    half at up to context_window -- exactly one forward pass.
+
+    The source is joined across chunks. chunks[0] is NOT the top 62:
+    Data_Cleaning.r uses equal-size chunks, so a 100-asset book gives two
+    chunks of 50 and chunks[0] holds only the largest 50. Weights were
+    normalised across the whole portfolio in assemble_portfolios, so any
+    prefix of the joined weight vector is correctly scaled relative to the
+    book; pool_hidden renormalises whatever it receives.
+
+    This is deliberately coverage-independent: the contrastive step is the
+    same for paper / first-chunk / all-chunks / full-sequence, which is why
+    those variants share one trained model and differ only at extraction.
     """
-    limit = cfg["context_window"]
+    limit  = cfg["context_window"]
+    source = 2 * limit                    # so each strided half is <= limit
     items = []
     for rec in portfolios.itertuples(index=False):
-        if cfg["coverage"] == "full-sequence":
-            body = [t for c in rec.chunks for t in c][:limit]
-            w    = np.concatenate(rec.weights)[:limit] if len(rec.weights) else np.zeros(0)
+        body = [t for c in rec.chunks for t in c][:source]
+        if len(rec.weights):
+            w = np.concatenate(rec.weights)[:source]
         else:
-            body = list(rec.chunks[0])[:limit]
-            w    = np.asarray(rec.weights[0])[:limit]
+            w = np.ones(len(body), dtype=np.float64)
         if len(body) < 2:
             continue
+        if len(w) != len(body):           # defensive: keep weights in step
+            w = np.ones(len(body), dtype=np.float64)
         w = np.clip(np.asarray(w, dtype=np.float64), 0.0, None)
         items.append((encode_tokens(body, stoi), w))
     return items
@@ -372,7 +437,11 @@ class MLMDataset(Dataset):
 class PairDataset(Dataset):
     """Splits each portfolio into even/odd ranks for sentence-transformer
     training, carrying each half's pooling weights along so the contrastive
-    views are pooled exactly the way the final embedding will be."""
+    views are pooled exactly the way the final embedding will be.
+
+    pooling_sequences supplies bodies of up to 2 * context_window tokens,
+    so each strided half is at most context_window and fits one forward
+    pass without truncation."""
 
     def __init__(self, items, max_len):
         self.items = [(ids, w) for ids, w in items if len(ids) >= 2]
@@ -597,8 +666,22 @@ def finetune_sentence_transformer(model, pair_dataset, cfg):
 def compute_investor_embeddings(model, portfolios, stoi, cfg):
     """One pooled vector per investor, honouring --pooling and --coverage.
 
-    first-chunk / full-sequence
-        A single (truncated) sequence per investor -> one forward pass.
+    paper
+        The largest context_window positions, JOINED across chunks. This
+        is the paper's "average contextualized embedding for a given
+        investor for the largest 62 positions". Joining is required
+        because Data_Cleaning.r chunks equally, so chunk 1 is generally
+        shorter than the context window (see the module docstring).
+
+    first-chunk
+        LEGACY. Reads chunks[0] only, which under equal-size chunking is
+        NOT the largest 62 positions for most multi-chunk investors. Kept
+        so previously trained files remain reproducible; prefer "paper".
+
+    full-sequence
+        Same slice as "paper", but with a larger context window and with
+        MLM pretraining also run on the joined sequence, so attention
+        actually spans the book.
 
     all-chunks
         Every chunk is encoded separately and the results are SUMMED using
@@ -627,13 +710,13 @@ def compute_investor_embeddings(model, portfolios, stoi, cfg):
     # Flatten to a list of (investor_index, token_ids, weights) work items
     work = []
     for i, rec in enumerate(portfolios.itertuples(index=False)):
-        if cfg["coverage"] == "first-chunk":
-            body = list(rec.chunks[0])[: cfg["context_window"]]
-            w    = np.asarray(rec.weights[0])[: cfg["context_window"]]
-            work.append((i, encode_tokens(body, stoi), w))
-        elif cfg["coverage"] == "full-sequence":
+        if cfg["coverage"] in ("paper", "full-sequence"):
             body = [t for c in rec.chunks for t in c][: cfg["context_window"]]
             w    = np.concatenate(rec.weights)[: cfg["context_window"]]
+            work.append((i, encode_tokens(body, stoi), w))
+        elif cfg["coverage"] == "first-chunk":
+            body = list(rec.chunks[0])[: cfg["context_window"]]
+            w    = np.asarray(rec.weights[0])[: cfg["context_window"]]
             work.append((i, encode_tokens(body, stoi), w))
         else:  # all-chunks
             for chunk, w_chunk in zip(rec.chunks, rec.weights):
@@ -737,6 +820,19 @@ def process_quarter(parquet_path, cfg):
         print(f"  weights: derived from rank "
               f"({cfg['weight_scheme']}, alpha={cfg['weight_alpha']})")
 
+    # How much the equal-size chunking costs a chunks[0] readout. Printed so
+    # the "paper" vs "first-chunk" difference is visible per quarter rather
+    # than assumed.
+    first_len = portfolios["chunks"].apply(lambda cs: len(cs[0]))
+    full_len  = portfolios["chunks"].apply(lambda cs: sum(len(c) for c in cs))
+    top_len   = np.minimum(full_len, cfg["context_window"])
+    short = int((first_len < top_len).sum())
+    if short:
+        print(f"  chunk 1 is shorter than the top-{cfg['context_window']} "
+              f"slice for {short:,} investors "
+              f"(median {int(first_len[first_len < top_len].median())} "
+              f"vs {cfg['context_window']} positions)")
+
     # 2. Training sequences (coverage-dependent) + vocab
     sequences = training_sequences(portfolios, cfg)
     all_tokens = [t for seq in sequences for t in seq]
@@ -769,6 +865,12 @@ def process_quarter(parquet_path, cfg):
     # 6. Contrastive fine-tuning, pooled the same way as extraction
     pair_items   = pooling_sequences(portfolios, cfg, stoi)
     pair_dataset = PairDataset(pair_items, max_len)
+    if pair_items:
+        half_lens = [(len(ids) + 1) // 2 for ids, _ in pair_items]
+        print(f"  pair halves: median {int(np.median(half_lens))}, "
+              f"max {max(half_lens)} (context window {cfg['context_window']})")
+        assert max(half_lens) <= cfg["context_window"], \
+            "a contrastive half exceeds the context window"
     if len(pair_dataset) >= cfg["batch_size"]:
         finetune_history = finetune_sentence_transformer(bert, pair_dataset, cfg)
     else:
@@ -818,8 +920,14 @@ def main():
     parser.add_argument("--pooling", choices=["mean", "weighted"],
                         default="weighted")
     parser.add_argument("--coverage",
-                        choices=["first-chunk", "all-chunks", "full-sequence"],
-                        default="all-chunks")
+                        choices=["paper", "first-chunk", "all-chunks",
+                                 "full-sequence"],
+                        default="paper",
+                        help="'paper' = largest context_window positions "
+                             "joined across chunks (Gabaix et al.); "
+                             "'first-chunk' is legacy and reads chunks[0], "
+                             "which is NOT the top 62 under equal-size "
+                             "chunking")
     parser.add_argument("--weight-col", default="weights",
                         help="column with real per-token weights, if present")
     parser.add_argument("--weight-scheme",
@@ -864,6 +972,11 @@ def main():
     if cfg["coverage"] == "full-sequence" and cfg["context_window"] <= 62:
         print("[warn] --coverage full-sequence with context_window <= 62 "
               "still truncates long books; consider --context-window 128 or 256.")
+    if cfg["coverage"] == "first-chunk":
+        print("[warn] --coverage first-chunk reads chunks[0], which under "
+              "equal-size chunking is NOT the largest "
+              f"{cfg['context_window']} positions. Use --coverage paper "
+              "unless you are reproducing an older run.")
 
     random.seed(cfg["seed"])
     np.random.seed(cfg["seed"])
