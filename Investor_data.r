@@ -22,8 +22,9 @@
 # data.table is loaded FIRST on purpose: it masks first(), last() and between()
 # from dplyr, and inv_panel below calls first(). Loading it before tidyverse
 # leaves the dplyr versions on top of the search path.
-library(data.table)   # [FIX 10] step 13 rewrite
-library(tidyverse)
+library(data.table)
+library(dplyr); library(tidyr); library(purrr)
+library(readr); library(stringr); library(tibble)
 library(lubridate)
 library(dbplyr)
 library(RPostgres)
