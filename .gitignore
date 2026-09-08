@@ -21,3 +21,4 @@ models_weighted/
 report_*/
 embeddings_v3/
 models_v3/
+reference/_cache/

@@ -12,7 +12,17 @@
 ###   [FIX 5] row-count assertions and a retry+diagnostic on the entity pull
 ###   [FIX 6] price date filter pushed into SQL instead of downloading the
 ###           whole history and filtering client-side
+###   [FIX 7] feeder-master bridge is many-to-many; aggregated, not deduped
+###   [FIX 8] resilient connection: keepalives, statement_timeout, per-chunk
+###           retry on one connection, and an on-disk cache per pull
+###   [FIX 9] price pull restricted to candidate listings (was 287,649)
+###   [FIX 10] holder statistics rewritten with data.table; the unnest_longer
+###           version ran for many minutes at 100% CPU on the 85-quarter panel
 
+# data.table is loaded FIRST on purpose: it masks first(), last() and between()
+# from dplyr, and inv_panel below calls first(). Loading it before tidyverse
+# leaves the dplyr versions on top of the search path.
+library(data.table)   # [FIX 10] step 13 rewrite
 library(tidyverse)
 library(lubridate)
 library(dbplyr)
@@ -463,7 +473,12 @@ investors <- inv_panel |>
   mutate(style_any    = coalesce(fund_style, inst_style, mgr_style),
          turnover_any = coalesce(fund_turnover_label, inst_turnover_label,
                                  mgr_turnover_label),
-         aum_any      = coalesce(inst_total_aum, mgr_total_aum))
+         aum_any      = coalesce(inst_total_aum, mgr_total_aum),
+         # the feeder bridge only has rows for feeders, so the left join leaves
+         # NA for everyone else. FALSE is the correct value and makes the column
+         # usable as a logical downstream.
+         is_feeder    = coalesce(is_feeder, FALSE),
+         n_masters    = coalesce(n_masters, 0L))
 
 assert_rows(investors, nrow(inv_panel), "investors_master assembly")
 
@@ -548,7 +563,10 @@ sec_cov <- cached("sec_cov", fetch_by_ids(
   cols = c("fsym_id", "security_name", "iso_country", "mic_exchange_code",
            "issue_type", "cap_group", "universe_type", "fds_13f_flag",
            "active"))) |>
-  rename(listing_iso_country = iso_country)   # [FIX 4] keep as a domicile fallback
+  rename(listing_iso_country = iso_country) |>   # [FIX 4] domicile fallback
+  # one row per listing: a duplicate here would multiply securities_detail and
+  # inflate n_listings
+  distinct(fsym_id, .keep_all = TRUE)
 
 # [FIX 8] factset_common.wrds_securities is a WRDS-built view over a global
 # security universe and is frequently unindexed on factset_entity_id, so a
@@ -578,23 +596,62 @@ if (PULL_WRDS_SECURITIES) {
 # silently drop names. [FIX 2] the window now tracks AS_OF; [FIX 6] the date
 # predicate runs on the server.
 step("Prices and shares outstanding (market caps) - the slowest pull")
+
+# [FIX 9] Do not price all 287,649 mapped listings. own_sec_coverage_eq covers
+# only ~29% of them, and a listing absent from the ownership coverage table is
+# unlikely to have rows in own_sec_prices_eq either, so most of that pull is
+# wasted round trips against the largest table in the script. Keep a listing if
+# ANY of the following holds:
+#   - its issue_type is ordinary common equity, or
+#   - its issuer has NO covered listing at all, or
+#   - its issuer has covered listings but NONE of them are equity (funds,
+#     warrants, preferred only). Without this third arm 3,054 issuers lost
+#     their market cap entirely.
+cov_ent <- sec_map |> filter(fsym_id %in% sec_cov$fsym_id) |>
+  pull(factset_entity_id) |> unique()
+
+eq_fsym <- sec_cov |> filter(issue_type %in% c("EQ", "SHARE")) |>
+  pull(fsym_id) |> unique()
+
+eq_ent <- sec_map |> filter(fsym_id %in% eq_fsym) |>
+  pull(factset_entity_id) |> unique()
+
+price_fsym <- sec_map |>
+  filter(fsym_id %in% eq_fsym |
+           !factset_entity_id %in% cov_ent |
+           !factset_entity_id %in% eq_ent) |>
+  pull(fsym_id) |> unique()
+
+n_ent_kept <- sec_map |> filter(fsym_id %in% price_fsym) |>
+  distinct(factset_entity_id) |> nrow()
+cat(sprintf("Price candidates: %s of %s listings (%.1f%%); %s of %s issuers retain one\n",
+            format(length(price_fsym), big.mark = ","),
+            format(length(fsym_ids), big.mark = ","),
+            100 * length(price_fsym) / length(fsym_ids),
+            format(n_ent_kept, big.mark = ","),
+            format(n_distinct(sec_map$factset_entity_id), big.mark = ",")))
+if (n_ent_kept < n_distinct(sec_map$factset_entity_id))
+  warning(sprintf("%d issuer(s) have no priceable candidate listing",
+                  n_distinct(sec_map$factset_entity_id) - n_ent_kept))
+
 prices <- cached(sprintf("prices_%s_%dd", AS_OF, PRICE_LOOKBACK_DAYS),
                  fetch_by_ids(
-                   "factset_own", "own_sec_prices_eq", "fsym_id", fsym_ids,
+                   "factset_own", "own_sec_prices_eq", "fsym_id", price_fsym,
                    cols = c("fsym_id", "price_date", "adj_price",
                             "adj_shares_outstanding"),
                    where = sprintf("price_date >= '%s' AND price_date <= '%s'",
-                                   PRICE_DATE_FROM, PRICE_DATE_TO))) |>
+                                   PRICE_DATE_FROM, PRICE_DATE_TO),
+                   chunk = 1000)) |>
   filter(!is.na(adj_price), !is.na(adj_shares_outstanding)) |>
   group_by(fsym_id) |>
   slice_max(price_date, n = 1, with_ties = FALSE) |>
   ungroup() |>
   mutate(market_cap = adj_price * adj_shares_outstanding)
 
-cat(sprintf("Market cap resolved for %s of %s listings (%.1f%%)\n",
+cat(sprintf("Market cap resolved for %s of %s candidate listings (%.1f%%)\n",
             format(nrow(prices), big.mark = ","),
-            format(length(fsym_ids), big.mark = ","),
-            100 * nrow(prices) / length(fsym_ids)))
+            format(length(price_fsym), big.mark = ","),
+            100 * nrow(prices) / length(price_fsym)))
 
 # 4d. listing-level detail (kept for future use)
 securities_detail <- sec_map |>
@@ -614,32 +671,39 @@ write_parquet(securities_detail,
 # unsponsored BDR on B3, which carries no price, no shares outstanding and
 # no entity link.
 #
+# NOTE on focus_flag: it is tempting to use it here, but it does not exist at
+# listing level. own_sec_entity_eq is a bare two-column bridge (fsym_id,
+# factset_entity_id); the focus_flag that appears in securities_master comes
+# from factset.sym_entity_sector_rbics and marks the entity's primary RBICS
+# SECTOR, not its primary security. It is useless for choosing a listing.
+#
 # The replacement is an explicit deterministic preference order:
-#   1. focus_flag, FactSet's own primary-security marker
-#   2. ordinary common equity ahead of receipts, ahead of warrants/rights/units
-#   3. an active listing ahead of an inactive one
-#   4. a listing with a known market cap ahead of one without
-#   5. largest market cap
-#   6. fsym_id, so the result is reproducible when everything else ties
+#   1. ordinary common equity ahead of receipts, ahead of warrants/rights
+#      (issue_type is only known for listings present in own_sec_coverage_eq,
+#      which covers ~29% of the mapped listings; unknown ranks mid-table so an
+#      uncovered ordinary line still beats a known warrant)
+#   2. an active listing ahead of an inactive one
+#   3. a listing with a known market cap ahead of one without
+#   4. largest market cap
+#   5. fsym_id, so the result is reproducible when everything else ties
 ISSUE_RANK <- function(x) case_when(
-  x %in% c("EQ", "SHARE")            ~ 5L,   # ordinary common
+  x %in% c("EQ", "SHARE")            ~ 6L,   # ordinary common
   x %in% c("PF", "PC", "CV")         ~ 3L,   # preferred / convertible
   x %in% c("AD", "GD", "DR")         ~ 2L,   # depositary receipts, incl. BDRs
   x %in% c("WT", "RT", "UT")         ~ 1L,   # warrants, rights, units
-  TRUE                               ~ 4L    # unknown: above receipts, below common
+  x %in% c("OE", "CE", "ET")         ~ 2L,   # fund instruments, not operating cos
+  TRUE                               ~ 4L    # unknown / not in coverage table
 )
 
 primary_listing <- securities_detail |>
   mutate(
-    r_focus  = as.integer(!is.na(focus_flag) &
-                            toupper(as.character(focus_flag)) %in% c("1", "Y", "TRUE")),
     r_type   = ISSUE_RANK(issue_type),
     r_active = as.integer(is.na(active) |
                             toupper(as.character(active)) %in% c("1", "Y", "TRUE")),
     r_cap    = as.integer(!is.na(market_cap)),
     r_capval = coalesce(market_cap, -Inf)
   ) |>
-  arrange(issuer_id, desc(r_focus), desc(r_type), desc(r_active),
+  arrange(issuer_id, desc(r_type), desc(r_active),
           desc(r_cap), desc(r_capval), fsym_id) |>
   group_by(issuer_id) |>
   slice_head(n = 1) |>
@@ -651,17 +715,63 @@ primary_listing <- securities_detail |>
 n_listings <- securities_detail |> count(issuer_id, name = "n_listings")
 
 # 4f. holder statistics from the local files
+#
+# [FIX 10] The old block was:
+#     panel |> unnest_longer(tokens) |> distinct() |> group_by() |> summarise()
+# which expands the whole investor-issuer-quarter cross product in one dplyr
+# pipeline that copies at every stage. On the 85-quarter panel it ran for many
+# minutes at 100% CPU and 2.5 GB with no progress output.
+#
+# Materialising that table at all is the problem: ~150M rows x 3 columns is
+# several GB of pointers before any grouping happens. The two statistics need
+# different granularities, so accumulate them separately and never hold the
+# full expansion:
+#
+#   n_holders_total  needs globally distinct (issuer, investor) pairs, so
+#                    dedupe incrementally. Bounded by the number of distinct
+#                    pairs, far smaller than the number of positions.
+#   n_quarters,      need only (issuer, quarter), at most
+#   first_, last_    35,961 x 85 rows. Trivial.
 step("Computing issuer holder statistics (local)")
-sec_panel <- panel |>
-  select(investor_id, quarter_end, tokens) |>
-  unnest_longer(tokens, values_to = "issuer_id") |>
-  distinct(quarter_end, investor_id, issuer_id) |>
-  group_by(issuer_id) |>
-  summarise(n_holders_total = n_distinct(investor_id),
-            n_quarters      = n_distinct(quarter_end),
-            first_quarter   = min(quarter_end),
-            last_quarter    = max(quarter_end),
-            .groups = "drop")
+iv   <- NULL                      # distinct issuer-investor pairs, accumulated
+iq   <- vector("list", length(seq_files))   # issuer-quarter, one row per pair
+
+for (i in seq_along(seq_files)) {
+  q <- read_parquet(seq_files[i]) |> select(investor_id, quarter_end, tokens)
+  n <- lengths(q$tokens)
+  iss <- unlist(q$tokens, use.names = FALSE)
+
+  d <- unique(data.table(issuer_id = iss, investor_id = rep(q$investor_id, n)))
+  iv <- if (is.null(iv)) d else unique(rbindlist(list(iv, d)))
+
+  iq[[i]] <- data.table(issuer_id   = unique(iss),
+                        quarter_end = q$quarter_end[1])
+
+  rm(q, n, iss, d)
+  cat(sprintf("\r    file %d/%d | %s distinct issuer-investor pairs",
+              i, length(seq_files), format(nrow(iv), big.mark = ",")))
+  flush.console()
+}
+cat("\n")
+
+# quarter_end is taken from the first row of each file, so verify each file
+# really is a single quarter before trusting n_quarters
+stopifnot(!any(duplicated(rbindlist(iq)[, .(issuer_id, quarter_end)])))
+
+iq <- rbindlist(iq)
+
+sec_panel <- merge(
+  iv[, .(n_holders_total = uniqueN(investor_id)), by = issuer_id],
+  iq[, .(n_quarters    = uniqueN(quarter_end),
+         first_quarter = min(quarter_end),
+         last_quarter  = max(quarter_end)), by = issuer_id],
+  by = "issuer_id", all = TRUE) |> as_tibble()
+
+rm(iv, iq); gc()
+
+# panel is the largest object in the session and nothing below this point
+# needs it
+rm(panel); gc()
 
 step("Assembling securities_master")
 securities <- sec_panel |>
@@ -750,6 +860,19 @@ if ("price_date" %in% names(securities)) {
               quantile(lag_days, 0.9, na.rm = TRUE),
               max(lag_days, na.rm = TRUE)))
 }
+
+# [FIX 11] market_cap = adj_price * adj_shares_outstanding, and the UNITS of
+# adj_shares_outstanding are a FactSet convention, not something the script can
+# infer. Print the largest issuers so the magnitude can be eyeballed against a
+# known figure: the biggest US listings should be in the low trillions of USD
+# at end-2025. If they come out ~1000x too small or too large, every med_cap
+# and cap-band statistic downstream is on the wrong scale.
+cat("\n  market cap sanity check (largest 5 issuers, raw units):\n")
+print(securities |>
+        filter(!is.na(market_cap)) |>
+        slice_max(market_cap, n = 5) |>
+        transmute(entity_proper_name, cap_group,
+                  market_cap_bn = round(market_cap / 1e9, 1)))
 
 cat("\n  where names and domiciles came from:\n")
 print(securities |> count(name_source) |>
