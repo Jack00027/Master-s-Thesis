@@ -143,10 +143,10 @@ N_RESTART <- 8
 #               Independent of any likelihood penalty, which is what makes it
 #               usable when BIC fails.
 #   "fixed"     take K_FINAL, chosen on interpretability and documented.
-K_RULE    <- "stability"
+K_RULE    <- "fixed"
 STAB_B    <- 20         # subsample fits per k
 STAB_FRAC <- 0.80       # share of investors in each subsample
-K_FINAL   <- NA         # NA = take the BIC winner; or set a number yourself.
+K_FINAL   <- 8         # NA = take the BIC winner; or set a number yourself.
                         # Reset explicitly below, because re-sourcing in the
                         # same session would otherwise leave it numeric from
                         # the previous run and silently ignore a new best_k.
@@ -165,7 +165,7 @@ cat(sprintf("Quarter: %s | arm: %s | universe: %s\nEmbeddings: %s\n",
 
 if (!file.exists(EMB_FILE)) {
   msg <- sprintf("embedding file not found: %s", EMB_FILE)
-  
+
   stop(msg)
 }
 stopifnot(file.exists(DATA_FILE))
