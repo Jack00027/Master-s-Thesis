@@ -76,14 +76,6 @@ EMB_FILE <- switch(
                      QUARTER),
   stop("ARM must be 'baseline' or 'weighted'"))
 
-# Superseded files from the pre-correction runs. They are still on disk and
-# would load without complaint, so name them explicitly rather than letting a
-# stale path go unnoticed.
-LEGACY_FILE <- switch(
-  ARM,
-  baseline = sprintf("embeddings_v2/q_%s.parquet", QUARTER),
-  weighted = sprintf("embeddings_weighted/q_%s__weighted_first-chunk.parquet",
-                     QUARTER))
 
 DATA_FILE <- sprintf("data/q_%s.parquet", QUARTER)
 INV_REF   <- "reference/investors_master.parquet"
@@ -132,7 +124,28 @@ FIT_CACHE <- sprintf("mixture_fits_%s_%s%s.rds", ARM, QUARTER, SUFFIX)
 OUT_TAG   <- sprintf("%s_%s%s", ARM, QUARTER, SUFFIX)
 TAB_TAG   <- paste0(OUT_TAG, if (WEIGHT_HOLDINGS) "_wh" else "")
 
-K_GRID    <- 2:12       # k values tried in the BIC sweep
+K_GRID    <- 2:12       # k values tried in the BIC sweep. See K_RULE: BIC
+                        # does not turn over for this model, so widening the
+                        # grid moves the "winner", it does not settle it.
+
+# EM is run N_RESTART times per k from different starts and the best fit that
+# RETAINS k components is kept. A single start per k compares local optima of
+# varying quality: the first US-only run produced BIC improvements of -138k at
+# k=7 against -70k at k=6 and then +14k at k=8, and k=9 returned a solution
+# bit-identical to k=7. Neither is a property of the data.
+N_RESTART <- 8
+
+# How the reported k is chosen.
+#   "bic"       lowest BIC among fits retaining k components. Honest only if
+#               the curve has an interior minimum -- check the sweep first.
+#   "stability" refit on bootstrap subsamples and keep the k whose partition
+#               reproduces best (mean ARI across pairs of subsample fits).
+#               Independent of any likelihood penalty, which is what makes it
+#               usable when BIC fails.
+#   "fixed"     take K_FINAL, chosen on interpretability and documented.
+K_RULE    <- "stability"
+STAB_B    <- 20         # subsample fits per k
+STAB_FRAC <- 0.80       # share of investors in each subsample
 K_FINAL   <- NA         # NA = take the BIC winner; or set a number yourself.
                         # Reset explicitly below, because re-sourcing in the
                         # same session would otherwise leave it numeric from
@@ -152,11 +165,7 @@ cat(sprintf("Quarter: %s | arm: %s | universe: %s\nEmbeddings: %s\n",
 
 if (!file.exists(EMB_FILE)) {
   msg <- sprintf("embedding file not found: %s", EMB_FILE)
-  if (file.exists(LEGACY_FILE))
-    msg <- paste0(msg, "\n  The pre-correction file ", LEGACY_FILE,
-                  " does exist. It was built with --coverage first-chunk and",
-                  "\n  is NOT the paper's top-", CONTEXT_WINDOW,
-                  " slice. Re-run 05_train_all.sh rather than pointing here.")
+  
   stop(msg)
 }
 stopifnot(file.exists(DATA_FILE))
@@ -372,45 +381,147 @@ if (cache_ok) {
         sprintf("smallest admissible component holds >= %d investors\n", MIN_COMP),
         sep = "")
 
+  # One EM run per k compares local optima, not models. Restart and keep the
+  # best fit that retained k components; report how many restarts collapsed,
+  # because a k that collapses often is unstable regardless of its BIC.
+  fit_k <- function(k, n_restart, seed0) {
+    best <- NULL; n_ok <- 0L; n_collapse <- 0L; n_fail <- 0L
+    for (s in seq_len(n_restart)) {
+      set.seed(seed0 + 1000L * k + s)
+      f <- try(flexmix(X ~ 1, k = k, model = FLXMCspcauchy(),
+                       control = list(minprior = eff_minprior)), silent = TRUE)
+      if (inherits(f, "try-error") || !is.finite(as.numeric(logLik(f)))) {
+        n_fail <- n_fail + 1L; next
+      }
+      if (length(unique(clusters(f))) != k) { n_collapse <- n_collapse + 1L; next }
+      n_ok <- n_ok + 1L
+      if (is.null(best) || BIC(f) < BIC(best)) best <- f
+    }
+    list(fit = best, n_ok = n_ok, n_collapse = n_collapse, n_fail = n_fail)
+  }
+
   sweep <- data.frame(); fits <- list()
   for (k in K_GRID) {
-    set.seed(SEED)
-    # a degenerate component makes the likelihood non-finite and throws; that
-    # k is skipped rather than aborting the whole sweep
-    fit <- try(flexmix(X ~ 1, k = k, model = FLXMCspcauchy(),
-                       control = list(minprior = eff_minprior)),
-               silent = TRUE)
-    if (inherits(fit, "try-error") || !is.finite(as.numeric(logLik(fit)))) {
-      cat(sprintf("k=%2d -> FAILED (degenerate component); skipped\n", k))
+    r <- fit_k(k, N_RESTART, SEED)
+    if (is.null(r$fit)) {
+      cat(sprintf("k=%2d -> no restart retained %d components (%d collapsed, %d failed)\n",
+                  k, k, r$n_collapse, r$n_fail))
       next
     }
-    fits[[as.character(k)]] <- fit
-    sweep <- rbind(sweep, data.frame(k_asked = k,
-                                     k_kept  = length(unique(clusters(fit))),
-                                     logLik  = as.numeric(logLik(fit)),
-                                     BIC     = BIC(fit)))
-    cat(sprintf("k=%2d -> kept %d components, BIC = %.0f\n",
-                k, tail(sweep$k_kept, 1), tail(sweep$BIC, 1)))
+    fits[[as.character(k)]] <- r$fit
+    sweep <- rbind(sweep, data.frame(
+      k_asked = k, k_kept = length(unique(clusters(r$fit))),
+      logLik = as.numeric(logLik(r$fit)), BIC = BIC(r$fit),
+      n_ok = r$n_ok, n_collapse = r$n_collapse, n_fail = r$n_fail))
+    cat(sprintf("k=%2d -> BIC = %10.0f  (%d/%d restarts kept %d components)\n",
+                k, BIC(r$fit), r$n_ok, N_RESTART, k))
   }
   if (!nrow(sweep)) stop("every k failed; raise MIN_COMP or shorten K_GRID")
   saveRDS(list(fits = fits, sweep = sweep, emb_file = EMB_FILE,
                n_obs = nrow(X), context_window = CONTEXT_WINDOW,
                us_threshold = if (US_ONLY) US_THRESHOLD else NA_real_,
-               seed = SEED), FIT_CACHE)
+               seed = SEED, n_restart = N_RESTART), FIT_CACHE)
   cat(sprintf("Cached mixture fits -> %s\n", FIT_CACHE))
 }
-# Only fits that actually retained k components are eligible. EM can return
-# k-1 with a materially worse likelihood; selecting such a k would report one
-# number and deliver another.
+# ---- is BIC even usable here? --------------------------------------------
+# A spherical Cauchy component in d dimensions costs ~d+1 parameters (d-1 free
+# for mu on the sphere, plus rho, plus a mixing weight). The BIC penalty is
+# therefore about (d+1)*log(n) per component, which for d = 64 and n in the
+# thousands is a few hundred -- against likelihood gains in the tens of
+# thousands. BIC is then effectively pure log-likelihood, which is monotone in
+# k, and it will select whatever the largest fitted k happens to be. Heavy
+# Cauchy tails compound this: no component is ever badly misfit, so no k is
+# ever penalised for being too small.
+#
+# The diagnostic below states the arithmetic rather than leaving the reader to
+# discover a boundary selection.
+d_emb    <- ncol(X)
+pen_comp <- (d_emb + 1) * log(nrow(X))
+d_bic    <- diff(sweep$BIC[order(sweep$k_asked)])
+cat(sprintf(paste0(
+  "\n=== Can BIC select k here? ===\n",
+  "  penalty per added component : %8.0f   ((d+1) log n, d = %d, n = %s)\n",
+  "  median |BIC improvement|    : %8.0f\n",
+  "  ratio                       : %8.1f x\n"),
+  pen_comp, d_emb, format(nrow(X), big.mark = ","),
+  median(abs(d_bic)), median(abs(d_bic)) / pen_comp))
+monotone <- all(d_bic < 0)
+if (monotone)
+  cat("  BIC falls at EVERY step: no interior minimum exists on this grid.\n",
+      "  A 'winner' would be the grid boundary. Use K_RULE = \"stability\".\n",
+      sep = "")
+
 ok_fit <- sweep$k_kept == sweep$k_asked
 if (any(!ok_fit))
-  cat(sprintf("\n[note] k = %s returned fewer components than asked and are\n",
-              paste(sweep$k_asked[!ok_fit], collapse = ", ")),
-      "       excluded from selection (EM initialisation sensitivity)\n", sep = "")
+  cat(sprintf("\n[note] k = %s never retained k components across %d restarts\n",
+              paste(sweep$k_asked[!ok_fit], collapse = ", "), N_RESTART))
 if (!any(ok_fit)) stop("no k retained the requested number of components")
-best_k <- sweep$k_asked[ok_fit][which.min(sweep$BIC[ok_fit])]
-cat(sprintf("\nBIC selects k = %d%s\n", best_k,
-            if (best_k == max(K_GRID)) "  (GRID BOUNDARY - not an interior optimum)" else ""))
+best_k_bic <- sweep$k_asked[ok_fit][which.min(sweep$BIC[ok_fit])]
+cat(sprintf("\nBIC minimum among eligible fits: k = %d%s\n", best_k_bic,
+            if (best_k_bic == max(sweep$k_asked[ok_fit]))
+              "  (TOP OF THE ELIGIBLE RANGE - not an interior optimum)" else ""))
+
+# ---- stability selection --------------------------------------------------
+# Refit on overlapping subsamples and ask how reproducible each k's partition
+# is. Two fits are compared on the investors they share, by adjusted Rand
+# index. This uses no likelihood penalty at all, which is exactly why it still
+# works when BIC does not: a k that splits real structure reproduces; a k that
+# splits noise does not.
+stability_curve <- NULL
+if (K_RULE == "stability") {
+  cat(sprintf("\n=== Stability selection (%d subsamples of %.0f%%, ARI) ===\n",
+              STAB_B, 100 * STAB_FRAC))
+  ks <- sweep$k_asked[ok_fit]
+  stability_curve <- purrr::map_dfr(ks, function(k) {
+    parts <- vector("list", STAB_B)
+    for (b in seq_len(STAB_B)) {
+      set.seed(SEED + 7919L * k + b)
+      idx_b <- sample(nrow(X), floor(STAB_FRAC * nrow(X)))
+      f <- try(flexmix(X[idx_b, , drop = FALSE] ~ 1, k = k,
+                       model = FLXMCspcauchy(),
+                       control = list(minprior = eff_minprior)), silent = TRUE)
+      if (inherits(f, "try-error") || !is.finite(as.numeric(logLik(f)))) next
+      parts[[b]] <- setNames(clusters(f), idx_b)
+    }
+    parts <- Filter(Negate(is.null), parts)
+    if (length(parts) < 2) return(tibble(k = k, mean_ari = NA_real_,
+                                         sd_ari = NA_real_, n_pairs = 0L))
+    aris <- c()
+    for (i in seq_len(length(parts) - 1)) for (j in (i + 1):length(parts)) {
+      shared <- intersect(names(parts[[i]]), names(parts[[j]]))
+      if (length(shared) < 100) next
+      aris <- c(aris, mclust::adjustedRandIndex(parts[[i]][shared],
+                                                parts[[j]][shared]))
+    }
+    cat(sprintf("  k=%2d  mean ARI = %.3f  (sd %.3f, %d pairs)\n",
+                k, mean(aris), stats::sd(aris), length(aris)))
+    tibble(k = k, mean_ari = mean(aris), sd_ari = stats::sd(aris),
+           n_pairs = length(aris))
+  })
+}
+
+best_k <- switch(
+  K_RULE,
+  bic = best_k_bic,
+  stability = {
+    if (is.null(stability_curve) || all(is.na(stability_curve$mean_ari)))
+      stop("stability selection produced no usable ARI values")
+    kk <- stability_curve$k[which.max(stability_curve$mean_ari)]
+    cat(sprintf("\nStability selects k = %d (mean ARI %.3f)\n", kk,
+                max(stability_curve$mean_ari, na.rm = TRUE)))
+    if (best_k_bic != kk)
+      cat(sprintf("  BIC would have taken k = %d; they disagree, which is the\n",
+                  best_k_bic),
+          "  expected outcome when the BIC curve has no interior minimum.\n",
+          sep = "")
+    kk
+  },
+  fixed = {
+    if (is.na(K_FINAL))
+      stop("K_RULE is \"fixed\" but K_FINAL is NA; set it in the CONFIG block")
+    K_FINAL
+  },
+  stop("K_RULE must be \"bic\", \"stability\" or \"fixed\""))
 
 # Re-sourcing safety. K_FINAL is overwritten below with a number, so a second
 # source() in the same session would find it already numeric and never consult
@@ -483,6 +594,21 @@ cat(sprintf("Holdings: %s positions | %.1f%% of issuers named | weighting: %s\n"
             format(nrow(long), big.mark = ","),
             100 * mean(!is.na(long$entity_proper_name)),
             if (WEIGHT_HOLDINGS) "portfolio share" else "equal per position"))
+
+# Widely-held issuers missing from securities_master surface as an "NA" row in
+# the distinctive-holdings table, where they can outrank every real name. Name
+# the worst offenders so the gap is chased rather than printed.
+unnamed <- long |> filter(is.na(entity_proper_name)) |>
+  distinct(investor_id, issuer_id) |>
+  count(issuer_id, name = "n_holders", sort = TRUE) |>
+  mutate(pct_of_investors = round(100 * n_holders / n_distinct(long$investor_id), 1))
+if (nrow(unnamed)) {
+  cat(sprintf("[warn] %s issuer(s) have no name in %s. Top by holder count:\n",
+              format(nrow(unnamed), big.mark = ","), SEC_REF))
+  print(head(unnamed, 5), n = 5)
+  cat("       Anything above a few percent will distort Lens C; re-run\n",
+      "       Investor_data.r if these are common names.\n", sep = "")
+}
 
 # ---- helpers ----------------------------------------------------------------
 # lift = share within cluster / share overall. >1 over-represented.
@@ -576,13 +702,20 @@ print(inv |>
                   .groups = "drop"), n = Inf, width = Inf)
 
 cat("\n=== Size and breadth ===\n")
+cat(sprintf("[note] aum_any: panel median %s, max %s (units as supplied by FactSet)\n",
+            format(round(median(inv$aum_any, na.rm = TRUE), 1), big.mark = ","),
+            format(round(max(inv$aum_any, na.rm = TRUE), 1), big.mark = ",")))
 # n_assets_full is the WHOLE book, not the top-CONTEXT_WINDOW slice, so
 # pct_over_62 reports how many investors have a book the encoder truncated.
 breadth <- seqs_all |> distinct(investor_id, n_assets_full) |>
   inner_join(cl_df, by = "investor_id")
 print(inv |>
         group_by(cluster) |>
-        summarise(med_aum_musd = round(median(aum_any, na.rm = TRUE) / 1e6, 1),
+        # aum_any is reported in whatever unit FactSet supplies; the previous
+        # /1e6 produced medians of 0.0-0.5 for funds holding 500 stocks, which
+        # is not credible. Printed raw, with the panel median alongside, so the
+        # unit can be read off rather than assumed.
+        summarise(med_aum_raw = round(median(aum_any, na.rm = TRUE), 1),
                   pct_aum_known = round(100 * mean(!is.na(aum_any)), 1),
                   .groups = "drop") |>
         left_join(breadth |> group_by(cluster) |>
@@ -828,6 +961,12 @@ assoc <- bind_rows(
                      "invt_obj_country_code")             ~ "geography",
     attribute %in% c("pct_top_sec", "invt_obj_specialization_code") ~ "sector",
     attribute %in% c("med_cap", "aum_any")                ~ "size",
+    # Portfolio breadth is a diversification choice, not an investment style.
+    # Left in "strategy" it was the family's top scorer and carried the
+    # headline on its own, which overstates the strategy case. It is also the
+    # attribute most entangled with the encoder's truncation, since the share
+    # of each cluster whose book exceeds the context window varies enormously.
+    attribute %in% c("n_assets_full")                     ~ "breadth",
     attribute %in% c("mgr_entity_proper_name",
                      "fs_ultimate_parent_entity_id")      ~ "artifact",
     attribute %in% c("investor_type", "fund_type_desc",
@@ -870,11 +1009,27 @@ missing_fam <- setdiff(unique(assoc$family), roll$family)
 if (length(missing_fam))
   cat(sprintf("[note] family absent from the rollup entirely: %s\n",
               paste(missing_fam, collapse = ", ")))
-cat("\nIf geography / artifact / vehicle outrank strategy, the clusters are\n",
-    "segmentation. If strategy attributes lead, they are strategy groups.\n")
+cat("\nReading this table:\n",
+    "  geography / artifact / vehicle on top -> the clusters are SEGMENTATION\n",
+    "  strategy on top                      -> they are STRATEGY groups\n",
+    "  size / breadth on top                -> neither; the clusters are\n",
+    "    organised by capitalisation band and portfolio width, which is a\n",
+    "    finding in its own right and should be reported as such rather than\n",
+    "    folded into either camp.\n", sep = "")
+
+# The strategy family without its strongest member, so the reader can see how
+# much of the strategy case rests on one attribute.
+strat <- assoc |> filter(family == "strategy", !is.na(strength)) |>
+  arrange(desc(strength))
+if (nrow(strat) >= 2)
+  cat(sprintf("\n[note] strategy family: best %s = %.3f, second %s = %.3f\n",
+              strat$attribute[1], strat$strength[1],
+              strat$attribute[2], strat$strength[2]))
 
 # ========================= 5. SAVE ===========================================
 saveRDS(list(cluster = cl_df, k = K_FINAL, rho = rho, sweep = sweep,
+             k_rule = K_RULE, stability = stability_curve,
+             best_k_bic = best_k_bic, n_restart = N_RESTART,
              posterior = posterior(spc), seed = SEED, quarter = QUARTER,
              arm = ARM, emb_file = EMB_FILE,
              context_window = CONTEXT_WINDOW, weight_holdings = WEIGHT_HOLDINGS,
