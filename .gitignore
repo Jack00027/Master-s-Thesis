@@ -19,3 +19,5 @@ mixture_fits_*.rds
 models_v2/
 models_weighted/
 report_*/
+embeddings_v3/
+models_v3/
