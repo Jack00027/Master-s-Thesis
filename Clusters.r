@@ -16,7 +16,7 @@
 #
 # Inputs
 #   embeddings_weighted/q_<date>__weighted_paper.parquet   (weighted arm)
-#   embeddings_v2/q_<date>__mean_paper.parquet             (baseline arm)
+#   embeddings_v3/q_<date>__mean_paper.parquet             (baseline arm)
 #   data/q_<date>.parquet                 token sequences
 #   reference/investors_master.parquet    investor attributes  (Investor_data.r)
 #   reference/securities_master.parquet   issuer attributes    (Investor_data.r)
@@ -54,7 +54,10 @@ library(flexmix)
 library(circlus)
 
 # ------------------------------ CONFIG ---------------------------------------
-QUARTER   <- "2026-03-31"      # most recent quarter in the regenerated panel
+QUARTER   <- "2025-12-31"      # reference quarter: the terminal point of the
+                               # Chapter 6 annual panel (YEARS ends 2025), so
+                               # the cross-section analysed here is the same
+                               # one the dynamics chain ends on
 
 # Must match --context-window in the training run that produced EMB_FILE.
 CONTEXT_WINDOW <- 62
@@ -68,7 +71,7 @@ ARM <- "weighted"
 
 EMB_FILE <- switch(
   ARM,
-  baseline = sprintf("embeddings_v2/q_%s__mean_paper.parquet", QUARTER),
+  baseline = sprintf("embeddings_v3/q_%s__mean_paper.parquet", QUARTER),
   weighted = sprintf("embeddings_weighted/q_%s__weighted_paper.parquet",
                      QUARTER),
   stop("ARM must be 'baseline' or 'weighted'"))
@@ -130,7 +133,10 @@ OUT_TAG   <- sprintf("%s_%s%s", ARM, QUARTER, SUFFIX)
 TAB_TAG   <- paste0(OUT_TAG, if (WEIGHT_HOLDINGS) "_wh" else "")
 
 K_GRID    <- 2:12       # k values tried in the BIC sweep
-K_FINAL   <- NA         # NA = take the BIC winner; or set a number yourself
+K_FINAL   <- NA         # NA = take the BIC winner; or set a number yourself.
+                        # Reset explicitly below, because re-sourcing in the
+                        # same session would otherwise leave it numeric from
+                        # the previous run and silently ignore a new best_k.
 SEED      <- 42
 MINPRIOR  <- 0.01       # smallest allowed cluster share (~1% of investors)
 MIN_COMP  <- 150        # ...but never fewer than this many investors,
@@ -157,7 +163,16 @@ stopifnot(file.exists(DATA_FILE))
 
 df <- read_parquet(EMB_FILE)
 X  <- as.matrix(df[, grepl("^dim_", names(df))])
-X  <- X / sqrt(rowSums(X^2))                 # unit length (cosine geometry)
+if (!ncol(X)) stop("no dim_* columns in ", EMB_FILE)
+if (anyDuplicated(df$investor_id))
+  stop(sprintf("%s has %d duplicated investor_id rows; X and meta would be ",
+               EMB_FILE, sum(duplicated(df$investor_id))),
+       "misaligned with the cluster labels")
+nrm <- sqrt(rowSums(X^2))
+if (any(!is.finite(nrm)) || any(nrm == 0))
+  stop(sprintf("%d embedding row(s) in %s have zero or non-finite norm",
+               sum(!is.finite(nrm) | nrm == 0), EMB_FILE))
+X  <- X / nrm                                # unit length (cosine geometry)
 meta <- df |> select(investor_id, quarter_end, investor_type)
 
 # ---- holdings, loaded here because the US filter needs them before the fit --
@@ -167,6 +182,17 @@ sec_ref <- read_parquet(SEC_REF) |>
     "entity_proper_name", "iso_country", "country_desc", "region_code",
     "sector_code", "factset_industry_desc", "factset_sector_code",
     "cap_group", "market_cap", "l2_id", "n_holders_total")))
+
+# sec_ref must hold at most ONE row per issuer. It is left-joined onto the
+# position table AFTER the top-CONTEXT_WINDOW cap, so a fan-out would give an
+# investor more than CONTEXT_WINDOW rows: the wt renormalisation would divide
+# by an inflated sum, every share in Lens C would be wrong, and nothing would
+# error. Deduplicate rather than fail, but say how many rows went.
+n_sec_raw <- nrow(sec_ref)
+sec_ref <- sec_ref |> distinct(issuer_id, .keep_all = TRUE)
+if (nrow(sec_ref) < n_sec_raw)
+  cat(sprintf("[warn] %s duplicate issuer_id row(s) in %s; kept the first of each\n",
+              format(n_sec_raw - nrow(sec_ref), big.mark = ","), SEC_REF))
 
 seqs_all <- read_parquet(DATA_FILE) |>
   semi_join(meta, by = "investor_id")
@@ -184,7 +210,13 @@ if (WEIGHT_HOLDINGS && !has_weights)
 # This is the slice --coverage paper feeds the encoder. Chunks are unnested
 # in chunk_id order and ranked globally, so rank 63 continues from chunk 1
 # into chunk 2 rather than restarting.
+# Only the first two chunks can contain a top-CONTEXT_WINDOW position. Under
+# the equal-size chunker the smallest chunk 1 is 32 (at n = 63), so chunks
+# 1+2 always supply at least 63 positions. Filtering before the unnest avoids
+# materialising every position of every 9,000-asset index fund -- roughly a
+# 60% reduction in intermediate rows on a full quarter.
 long_base <- seqs_all |>
+  filter(chunk_id <= 2) |>
   arrange(investor_id, chunk_id) |>
   mutate(pos = if (has_weights)
                  map2(tokens, weights,
@@ -215,9 +247,38 @@ cat(sprintf(paste0(
   if (n_short) as.integer(median(cmp$n1[cmp$n1 < cmp$ntop])) else 0L,
   CONTEXT_WINDOW))
 
-# position weight used by the holdings tables; 1 = count each position once
+# Position weight used by the holdings tables; 1 = count each position once.
+#
+# RENORMALISED WITHIN INVESTOR. `w` is a position's share of the WHOLE book,
+# but only the top CONTEXT_WINDOW positions are kept, so the retained weights
+# sum to well under 1 for a diversified fund and to ~1 for a concentrated one.
+# Left raw, an investor whose top 62 covers 95% of its book would contribute
+# ~4x the mass of one whose top 62 covers 25%, and the cluster tables would
+# describe the concentrated members far more than the diversified ones.
+# Dividing by the retained sum makes every investor contribute exactly 1, so
+# the tables read as the AVERAGE PORTFOLIO COMPOSITION across cluster members.
+# TWO weight columns, because two different objects need different things:
+#
+#   pw  portfolio weight, renormalised within the retained slice. Computed
+#       ALWAYS, identically in both arms. Used by inv_feat, i.e. by the
+#       association ranking.
+#   wt  what the Lens C tables count by. Follows the arm: pw for weighted
+#       pooling, 1 for mean pooling.
+#
+# Why they differ. Lens C is a PORTRAIT of what a cluster holds, so it should
+# match the representation it describes -- following the arm is right there.
+# The association ranking is a MEASURING INSTRUMENT, and it is read across
+# arms. If the instrument changed with the arm, a shift in the family ranking
+# could come from the clustering or from the yardstick and there would be no
+# way to tell which. So the features are fixed.
 long_base <- long_base |>
-  mutate(wt = if (WEIGHT_HOLDINGS) w else 1)
+  group_by(investor_id) |>
+  mutate(pw = if (has_weights) {
+                s <- sum(w, na.rm = TRUE)
+                if (is.finite(s) && s > 0) w / s else 1 / n()
+              } else 1 / n(),
+         wt = if (WEIGHT_HOLDINGS) pw else 1) |>
+  ungroup()
 
 # ---- optional restriction to predominantly-US investors -------------------
 us_share <- long_base |>
@@ -268,9 +329,35 @@ if (US_ONLY) {
               format(nrow(long_base), big.mark = ",")))
 }
 
+# The cache key is ARM + QUARTER + SUFFIX, none of which changed when the
+# embeddings were rebuilt with --coverage paper. A cache from the superseded
+# first-chunk run would therefore load silently and every result below would
+# describe the old representation. The provenance recorded inside the file is
+# checked instead of trusting the name.
+cache_ok <- FALSE
 if (file.exists(FIT_CACHE)) {
-  cat(sprintf("Loading cached mixture fits from %s\n", FIT_CACHE))
   cached <- readRDS(FIT_CACHE)
+  stale <- c(
+    if (is.null(cached$emb_file)) "written before provenance was recorded"
+    else if (!identical(cached$emb_file, EMB_FILE))
+      sprintf("fitted on %s, not %s", cached$emb_file, EMB_FILE),
+    if (!is.null(cached$n_obs) && !identical(cached$n_obs, nrow(X)))
+      sprintf("fitted on %s investors, now %s",
+              format(cached$n_obs, big.mark = ","),
+              format(nrow(X), big.mark = ",")),
+    if (!is.null(cached$context_window) &&
+        !identical(cached$context_window, CONTEXT_WINDOW))
+      sprintf("context window %d, now %d", cached$context_window, CONTEXT_WINDOW))
+  if (length(stale)) {
+    cat(sprintf("[warn] ignoring stale fit cache %s\n         (%s)\n         Refitting.\n",
+                FIT_CACHE, paste(stale, collapse = "; ")))
+  } else {
+    cache_ok <- TRUE
+  }
+}
+
+if (cache_ok) {
+  cat(sprintf("Loading cached mixture fits from %s\n", FIT_CACHE))
   fits <- cached$fits; sweep <- cached$sweep
   print(sweep)
 } else {
@@ -306,20 +393,56 @@ if (file.exists(FIT_CACHE)) {
                 k, tail(sweep$k_kept, 1), tail(sweep$BIC, 1)))
   }
   if (!nrow(sweep)) stop("every k failed; raise MIN_COMP or shorten K_GRID")
-  saveRDS(list(fits = fits, sweep = sweep), FIT_CACHE)
+  saveRDS(list(fits = fits, sweep = sweep, emb_file = EMB_FILE,
+               n_obs = nrow(X), context_window = CONTEXT_WINDOW,
+               us_threshold = if (US_ONLY) US_THRESHOLD else NA_real_,
+               seed = SEED), FIT_CACHE)
   cat(sprintf("Cached mixture fits -> %s\n", FIT_CACHE))
 }
-best_k <- sweep$k_asked[which.min(sweep$BIC)]
+# Only fits that actually retained k components are eligible. EM can return
+# k-1 with a materially worse likelihood; selecting such a k would report one
+# number and deliver another.
+ok_fit <- sweep$k_kept == sweep$k_asked
+if (any(!ok_fit))
+  cat(sprintf("\n[note] k = %s returned fewer components than asked and are\n",
+              paste(sweep$k_asked[!ok_fit], collapse = ", ")),
+      "       excluded from selection (EM initialisation sensitivity)\n", sep = "")
+if (!any(ok_fit)) stop("no k retained the requested number of components")
+best_k <- sweep$k_asked[ok_fit][which.min(sweep$BIC[ok_fit])]
 cat(sprintf("\nBIC selects k = %d%s\n", best_k,
             if (best_k == max(K_GRID)) "  (GRID BOUNDARY - not an interior optimum)" else ""))
 
-if (is.na(K_FINAL)) K_FINAL <- best_k
+# Re-sourcing safety. K_FINAL is overwritten below with a number, so a second
+# source() in the same session would find it already numeric and never consult
+# the new best_k. The user's choice is therefore captured UNCONDITIONALLY from
+# whatever the CONFIG block currently says: an earlier `if (!exists(...))`
+# guard here was worse than the bug, because it froze the first run's NA and
+# silently discarded any manual K_FINAL set afterwards.
+K_FINAL_USER <- K_FINAL
+K_FINAL <- if (is.na(K_FINAL_USER)) best_k else K_FINAL_USER
+
+# --- 3. a manually chosen k may not have been fitted at all ---
+if (is.null(fits[[as.character(K_FINAL)]]))
+  stop(sprintf(paste0("no fit stored at k = %d.\n",
+                      "  Fitted k: %s\n",
+                      "  (k values that failed or collapsed are absent.)"),
+               K_FINAL, paste(names(fits), collapse = ", ")))
+if (!is.na(K_FINAL_USER) && K_FINAL_USER != best_k)
+  cat(sprintf("[note] K_FINAL set manually to %d; BIC would have chosen %d\n",
+              K_FINAL_USER, best_k))
 spc    <- fits[[as.character(K_FINAL)]]
 labels <- clusters(spc)
 cl_df  <- tibble(investor_id = meta$investor_id, cluster = labels)
 
 rho <- as.numeric(parameters(spc)["rho", ])
-sizes <- cl_df |> count(cluster, name = "size") |> mutate(rho = round(rho, 3))
+sizes <- cl_df |> count(cluster, name = "size")
+# rho comes from parameters() in component order; sizes from count() in label
+# order. If the fit dropped a component these differ in length and the mutate
+# below would recycle silently.
+if (length(rho) != nrow(sizes))
+  stop(sprintf("fit at k = %d has %d rho values but %d non-empty clusters",
+               K_FINAL, length(rho), nrow(sizes)))
+sizes <- sizes |> mutate(rho = round(rho, 3))
 cat("\n=== Cluster sizes and concentration ===\n"); print(sizes, n = Inf)
 
 # ========================= 2. ATTACH REFERENCE DATA ==========================
@@ -558,27 +681,74 @@ if ("invt_obj_specialization_code" %in% names(inv)) {
 
 # ========================= 4. STRATEGY OR SEGMENTATION? ======================
 # One number per attribute: how much of cluster membership does it explain?
-#   categorical -> Cramer's V     (0 = independent, 1 = perfectly determined)
-#   continuous  -> eta-squared    (share of variance between clusters)
+#   categorical -> Cramer's V, bias-corrected (Bergsma 2013)
+#   continuous  -> rank-based epsilon-squared
 # Both are in [0,1]. They are different statistics, so read the RANKING
 # rather than comparing values across the two families too literally.
+#
+# Both depart from the textbook versions for reasons that bear directly on
+# the answer; see the function definitions below. n_levels is printed for the
+# categorical attributes because cardinality is what the correction addresses.
 cat("\n\n############ WHAT EXPLAINS THE CLUSTERS? ############\n")
 
+# Cramer's V, BIAS-CORRECTED (Bergsma 2013).
+#
+# The uncorrected statistic normalises by min(r, c) - 1, which here is always
+# k - 1 because the cluster label is the narrow margin. Nothing corrects for
+# the ROW dimension, so a variable with thousands of levels
+# (mgr_entity_proper_name, fs_ultimate_parent_entity_id) inflates chi-square
+# through near-empty cells and scores higher than a variable with four levels
+# for reasons of cardinality alone. Since the artifact family is exactly the
+# high-cardinality one, the uncorrected statistic tilts the strategy-versus-
+# segmentation ranking toward "artifact" by construction.
+#
+# The correction subtracts the expected chi-square under independence and
+# shrinks both dimensions accordingly. n_levels is reported alongside so the
+# reader can see which attributes are high-dimensional.
 cramers_v <- function(x, y) {
   ok <- !is.na(x) & !is.na(y)
   if (sum(ok) < 50 || n_distinct(x[ok]) < 2) return(NA_real_)
   tab <- table(x[ok], y[ok])
-  chi <- suppressWarnings(chisq.test(tab)$statistic)
   n <- sum(tab)
-  sqrt(as.numeric(chi) / (n * (min(dim(tab)) - 1)))
+  if (n <= 1) return(NA_real_)
+  chi  <- suppressWarnings(chisq.test(tab)$statistic)
+  phi2 <- as.numeric(chi) / n
+  r <- nrow(tab); c <- ncol(tab)
+  if (min(r, c) < 2) return(NA_real_)
+  phi2c <- max(0, phi2 - (r - 1) * (c - 1) / (n - 1))
+  rc <- r - (r - 1)^2 / (n - 1)
+  cc <- c - (c - 1)^2 / (n - 1)
+  denom <- min(rc, cc) - 1
+  if (denom <= 0) return(NA_real_)
+  sqrt(phi2c / denom)
 }
-eta_sq <- function(x, g) {
+
+# Rank-based epsilon-squared, NOT eta-squared.
+#
+# Plain eta-squared on the raw values returned ~0 for beta and momentum: a
+# handful of extreme tail values dominate the total sum of squares, so the
+# between-cluster share vanishes even when the clusters separate cleanly on
+# the bulk of the distribution. Ranking first bounds every observation's
+# influence and restores the signal. This matters directly: the affected
+# variables are the STRATEGY characteristics, i.e. the side of the central
+# question that the raw statistic was silently suppressing.
+# Weighted median: the smallest x at which cumulative weight reaches half.
+wmedian <- function(x, w) {
+  ok <- !is.na(x) & !is.na(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  x <- x[ok]; w <- w[ok]
+  o <- order(x); x <- x[o]; w <- w[o]
+  x[which(cumsum(w) / sum(w) >= 0.5)[1]]
+}
+
+eps_sq <- function(x, g) {
   ok <- !is.na(x) & !is.na(g)
   if (sum(ok) < 50) return(NA_real_)
-  x <- x[ok]; g <- factor(g[ok])
-  ss_tot <- sum((x - mean(x))^2)
-  ss_b <- sum(tapply(x, g, function(v) length(v) * (mean(v) - mean(x))^2))
-  if (ss_tot == 0) return(NA_real_) else ss_b / ss_tot
+  r <- rank(x[ok]); g <- factor(g[ok])
+  if (n_distinct(g) < 2) return(NA_real_)
+  ss_tot <- sum((r - mean(r))^2)
+  ss_b <- sum(tapply(r, g, function(v) length(v) * (mean(v) - mean(r))^2))
+  if (ss_tot == 0) NA_real_ else ss_b / ss_tot
 }
 
 # Investor-level features. Everything computed in the summarise() below is a
@@ -587,11 +757,26 @@ eta_sq <- function(x, g) {
 # that summarise() keeps only the columns it names, so issuer geography
 # reaches this table only via pct_us and modal_issuer_country - hence both
 # are constructed explicitly.
+# WEIGHTING, stated explicitly because it is mixed on purpose:
+#   pct_us, modal_issuer_country  UNWEIGHTED. pct_us must reproduce the US
+#     filter exactly, and modal_issuer_country is its categorical twin.
+#   pct_top_sec, med_cap          WEIGHTED by pw, in BOTH arms. Portfolio
+#     sector concentration and size exposure are weight concepts: a fund with
+#     40 tech names at 0.5% and 22 utilities at 3% is a utilities fund, and
+#     the count-based measure calls it a tech fund.
 inv_feat <- long |>
   group_by(investor_id) |>
   summarise(pct_us      = mean(iso_country == "US", na.rm = TRUE),
-            pct_top_sec = {t <- table(factset_industry_desc); if (length(t)) max(t)/sum(t) else NA_real_},
-            med_cap     = median(market_cap, na.rm = TRUE),
+            pct_top_sec = {
+              d <- tapply(pw, factset_industry_desc, sum)
+              if (length(d)) max(d, na.rm = TRUE) / sum(d, na.rm = TRUE)
+              else NA_real_
+            },
+            med_cap     = wmedian(market_cap, pw),
+            # count-based twins, kept only for the sensitivity print below
+            pct_top_sec_uw = {t <- table(factset_industry_desc)
+                              if (length(t)) max(t)/sum(t) else NA_real_},
+            med_cap_uw     = median(market_cap, na.rm = TRUE),
             # categorical counterpart of pct_us: the single country in which
             # the investor holds most of its identified positions
             modal_issuer_country = {
@@ -601,6 +786,18 @@ inv_feat <- long |>
             .groups = "drop") |>
   right_join(inv, by = "investor_id") |>
   left_join(breadth |> select(investor_id, n_assets_full), by = "investor_id")
+
+# Does the weighting choice change the answer? Printed rather than buried, so
+# the decision is auditable. The _uw twins are excluded from assoc below.
+cat("\n=== Weighted vs count-based features (sensitivity) ===\n")
+print(tibble(
+  feature = c("pct_top_sec", "med_cap"),
+  eps_sq_weighted = c(eps_sq(inv_feat$pct_top_sec,    inv_feat$cluster),
+                      eps_sq(inv_feat$med_cap,        inv_feat$cluster)),
+  eps_sq_counted  = c(eps_sq(inv_feat$pct_top_sec_uw, inv_feat$cluster),
+                      eps_sq(inv_feat$med_cap_uw,     inv_feat$cluster))) |>
+  mutate(across(where(is.numeric), ~round(.x, 3))))
+cat("Reported below: the WEIGHTED versions, in both arms.\n")
 
 cat_vars <- intersect(c("style_any", "turnover_any", "fund_type_desc",
                         "investor_type",
@@ -615,10 +812,14 @@ num_vars <- intersect(c("beta", "pe_ratio", "pb_ratio", "dividend_yield",
 
 assoc <- bind_rows(
   tibble(attribute = cat_vars, kind = "categorical",
+         statistic = "Cramer's V (bias-corrected)",
          strength = map_dbl(cat_vars, ~ cramers_v(inv_feat[[.x]], inv_feat$cluster)),
+         n_levels = map_dbl(cat_vars, ~ n_distinct(inv_feat[[.x]], na.rm = TRUE)),
          coverage = map_dbl(cat_vars, ~ mean(!is.na(inv_feat[[.x]])))),
   tibble(attribute = num_vars, kind = "continuous",
-         strength = map_dbl(num_vars, ~ eta_sq(inv_feat[[.x]], inv_feat$cluster)),
+         statistic = "rank epsilon-squared",
+         strength = map_dbl(num_vars, ~ eps_sq(inv_feat[[.x]], inv_feat$cluster)),
+         n_levels = NA_real_,
          coverage = map_dbl(num_vars, ~ mean(!is.na(inv_feat[[.x]]))))
 ) |>
   mutate(family = case_when(
@@ -649,10 +850,26 @@ if (US_ONLY) {
 }
 
 cat("\n=== Rolled up by family (max strength within family) ===\n")
-print(assoc |> group_by(family) |>
-        summarise(best_attribute = attribute[which.max(strength)],
-                  strength = max(strength, na.rm = TRUE), .groups = "drop") |>
-        arrange(desc(strength)), n = Inf)
+# Attributes whose statistic is NA are dropped BEFORE the rollup. With
+# na.rm = TRUE inside summarise(), a family in which every attribute is NA
+# gives which.max() a zero-length result (which errors) and max() -Inf.
+# That is reachable: under US_ONLY, modal_issuer_country can collapse to a
+# single level and return NA.
+roll <- assoc |> filter(!is.na(strength)) |> group_by(family) |>
+  summarise(best_attribute = attribute[which.max(strength)],
+            strength = max(strength),
+            n_scored = n(), .groups = "drop") |>
+  arrange(desc(strength))
+print(roll, n = Inf)
+
+dropped <- assoc |> filter(is.na(strength))
+if (nrow(dropped))
+  cat(sprintf("[note] not scored (too few observations or a single level): %s\n",
+              paste(dropped$attribute, collapse = ", ")))
+missing_fam <- setdiff(unique(assoc$family), roll$family)
+if (length(missing_fam))
+  cat(sprintf("[note] family absent from the rollup entirely: %s\n",
+              paste(missing_fam, collapse = ", ")))
 cat("\nIf geography / artifact / vehicle outrank strategy, the clusters are\n",
     "segmentation. If strategy attributes lead, they are strategy groups.\n")
 
@@ -661,6 +878,15 @@ saveRDS(list(cluster = cl_df, k = K_FINAL, rho = rho, sweep = sweep,
              posterior = posterior(spc), seed = SEED, quarter = QUARTER,
              arm = ARM, emb_file = EMB_FILE,
              context_window = CONTEXT_WINDOW, weight_holdings = WEIGHT_HOLDINGS,
+             stats = c(categorical = "Cramer's V (Bergsma-corrected)",
+                       continuous  = "rank epsilon-squared"),
+             feature_weighting = c(
+               pct_us = "unweighted (matches the US filter)",
+               modal_issuer_country = "unweighted",
+               pct_top_sec = "portfolio-weighted, both arms",
+               med_cap = "portfolio-weighted, both arms",
+               lens_c_tables = if (WEIGHT_HOLDINGS) "portfolio-weighted"
+                               else "equal per position"),
              style_tab = style_tab, distinctive = distinctive, assoc = assoc),
         sprintf("cluster_assignment_%s.rds", OUT_TAG))
 write.csv(assoc, sprintf("cluster_association_ranking_%s.csv", TAB_TAG),
