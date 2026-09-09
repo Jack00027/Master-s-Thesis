@@ -124,7 +124,7 @@ FIT_CACHE <- sprintf("mixture_fits_%s_%s%s.rds", ARM, QUARTER, SUFFIX)
 OUT_TAG   <- sprintf("%s_%s%s", ARM, QUARTER, SUFFIX)
 TAB_TAG   <- paste0(OUT_TAG, if (WEIGHT_HOLDINGS) "_wh" else "")
 
-K_GRID    <- 2:12       # k values tried in the BIC sweep. See K_RULE: BIC
+K_GRID    <- 5:10       # k values tried in the BIC sweep. See K_RULE: BIC
                         # does not turn over for this model, so widening the
                         # grid moves the "winner", it does not settle it.
 
@@ -143,13 +143,23 @@ N_RESTART <- 8
 #               Independent of any likelihood penalty, which is what makes it
 #               usable when BIC fails.
 #   "fixed"     take K_FINAL, chosen on interpretability and documented.
-K_RULE    <- "fixed"
+
+K_RULE    <- "stability"  # "bic", "stability" or "fixed"
+
 STAB_B    <- 20         # subsample fits per k
+
 STAB_FRAC <- 0.80       # share of investors in each subsample
+
+STAB_KMIN <- 4          # smallest k eligible for the stability ARGMAX. The
+                        # curve is computed and printed for the whole grid;
+                        # this only governs which k can win. See the note in
+                        # the stability branch for why 2 and 3 are excluded.
+
 K_FINAL   <- 8         # NA = take the BIC winner; or set a number yourself.
                         # Reset explicitly below, because re-sourcing in the
                         # same session would otherwise leave it numeric from
                         # the previous run and silently ignore a new best_k.
+
 SEED      <- 42
 MINPRIOR  <- 0.01       # smallest allowed cluster share (~1% of investors)
 MIN_COMP  <- 150        # ...but never fewer than this many investors,
@@ -503,12 +513,48 @@ if (K_RULE == "stability") {
 best_k <- switch(
   K_RULE,
   bic = best_k_bic,
-  stability = {
+    stability = {
     if (is.null(stability_curve) || all(is.na(stability_curve$mean_ari)))
       stop("stability selection produced no usable ARI values")
-    kk <- stability_curve$k[which.max(stability_curve$mean_ari)]
-    cat(sprintf("\nStability selects k = %d (mean ARI %.3f)\n", kk,
-                max(stability_curve$mean_ari, na.rm = TRUE)))
+
+    # Why k = 2 cannot be allowed to win. A two-component split of ANY point
+    # cloud reproduces almost perfectly across subsamples: the two halves are
+    # far apart relative to the noise, so every subsample recovers the same
+    # cut. Mean ARI is therefore near 1 at k = 2 whatever the data, and an
+    # unrestricted argmax returns 2 mechanically. The criterion is rewarding
+    # coarseness, not structure. On this panel k = 2 scored 0.993 against
+    # 0.64-0.73 everywhere above k = 3. Restricting the argmax to
+    # k >= STAB_KMIN asks the question actually intended -- among the
+    # resolutions worth reporting, which reproduces best -- while the full
+    # curve is still printed above, so the excluded values stay auditable.
+    elig <- stability_curve |> filter(k >= STAB_KMIN, !is.na(mean_ari))
+    if (!nrow(elig))
+      stop(sprintf("no k >= %d has a usable ARI; lower STAB_KMIN", STAB_KMIN))
+
+    dropped <- stability_curve |> filter(k < STAB_KMIN, !is.na(mean_ari))
+    if (nrow(dropped))
+      cat(sprintf("\n[note] k = %s excluded from the argmax (ARI %s):\n",
+                  paste(dropped$k, collapse = ", "),
+                  paste(sprintf("%.3f", dropped$mean_ari), collapse = ", ")),
+          sprintf("       a coarse split reproduces trivially. STAB_KMIN = %d.\n",
+                  STAB_KMIN), sep = "")
+
+    i_best <- which.max(elig$mean_ari)
+    kk <- elig$k[i_best]
+    cat(sprintf("\nStability selects k = %d (mean ARI %.3f, sd %.3f)\n",
+                kk, elig$mean_ari[i_best], elig$sd_ari[i_best]))
+
+    # Report the spread so a flat curve is not read as a sharp optimum. This
+    # is a legibility check, not a test: the ARI pairs share fits and are not
+    # independent, so no honest standard error is available here.
+    cat(sprintf("  eligible range: ARI %.3f-%.3f over k = %d-%d, median sd %.3f\n",
+                min(elig$mean_ari), max(elig$mean_ari),
+                min(elig$k), max(elig$k), stats::median(elig$sd_ari)))
+    if (diff(range(elig$mean_ari)) < stats::median(elig$sd_ari))
+      cat("  [warn] between-k differences are smaller than the within-k spread.\n",
+          "         Read this as 'no k in range is distinguishable', not as a\n",
+          "         selection. Choose k on interpretability and say so.\n", sep = "")
+
     if (best_k_bic != kk)
       cat(sprintf("  BIC would have taken k = %d; they disagree, which is the\n",
                   best_k_bic),
@@ -539,8 +585,11 @@ if (is.null(fits[[as.character(K_FINAL)]]))
                       "  (k values that failed or collapsed are absent.)"),
                K_FINAL, paste(names(fits), collapse = ", ")))
 if (!is.na(K_FINAL_USER) && K_FINAL_USER != best_k)
-  cat(sprintf("[note] K_FINAL set manually to %d; BIC would have chosen %d\n",
-              K_FINAL_USER, best_k))
+  cat(sprintf("[note] K_FINAL set manually to %d; %s would have chosen %d\n",
+              K_FINAL_USER,
+              switch(K_RULE, bic = "BIC", stability = "stability selection",
+                     fixed = "the fixed rule"),
+              best_k))
 spc    <- fits[[as.character(K_FINAL)]]
 labels <- clusters(spc)
 cl_df  <- tibble(investor_id = meta$investor_id, cluster = labels)
