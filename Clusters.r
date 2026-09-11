@@ -3,7 +3,7 @@
 #
 # Method: spherical Cauchy mixture (circlus / flexmix), fitted by EM.
 #
-#   1. Load embeddings, sweep k by BIC, fit the final mixture
+#   1. Load embeddings, fit the mixture at a PRE-CHOSEN k
 #   2. Attach the reference tables built by Investor_data.r
 #   3. Interpret each cluster through four lenses:
 #        A  WHO      investor type, fund type, style, turnover
@@ -13,6 +13,27 @@
 #   4. Rank every attribute by how strongly it explains cluster membership,
 #      which answers the central question quantitatively:
 #      are these clusters STRATEGY or SEGMENTATION?
+#
+# NOTE ON k  (changed)
+#   This script no longer selects k. It fits ONE mixture at K_FIXED and
+#   interprets it. Selection lives in choosing_k.r, which scans a grid on a
+#   subsample under two model families (spherical Cauchy mixture and spherical
+#   k-means) and reports BIC, subsample stability (ARI), restart retention,
+#   the fitted concentration profile and the smallest component. Run that
+#   first, shortlist two or three k, and set K_FIXED here for each in turn.
+#
+#   Three consequences of the split, recorded so they are not rediscovered:
+#     - The BIC-usability diagnostic (penalty per component vs median
+#       likelihood gain) now comes from choosing_k.r. It cannot be computed
+#       from a single fit, and the version formerly printed here evaluated
+#       diff() on a length-1 sweep, so it reported "BIC falls at EVERY step"
+#       on the strength of an empty vector.
+#     - plot_bic.R must read choosing_k_<arm>_<quarter>.rds, which stores
+#       mix_bic per k, rather than the sweep this script used to save.
+#     - The saved assignment RDS keeps the keys `sweep`, `stability`,
+#       `best_k_bic` and `k_rule` as NULL/NA placeholders, so downstream
+#       readers (Cluster_Dynamics_v3.r) find the same schema and fail loudly
+#       on a missing VALUE rather than silently on a missing NAME.
 #
 # Inputs
 #   embeddings_weighted/q_<date>__weighted_paper.parquet   (weighted arm)
@@ -29,7 +50,7 @@
 #   counterparts of issuer geography are computed explicitly from holdings:
 #   pct_us (continuous) and modal_issuer_country (categorical).
 #
-# NOTE ON THE HOLDINGS SLICE  (changed)
+# NOTE ON THE HOLDINGS SLICE
 #   The holdings view must be the SAME slice of the book the encoder saw,
 #   or every characterisation below describes a different portfolio from
 #   the one that produced the embedding.
@@ -67,7 +88,7 @@ CONTEXT_WINDOW <- 62
 #   "weighted" = the extension, positions weighted by portfolio share
 # Both arms now come from BERT_training_weighted.py with --coverage paper and
 # differ in --pooling alone, so the comparison isolates the pooling effect.
-ARM <- "weighted"
+ARM <- "weighted"  # "baseline" or "weighted"
 
 EMB_FILE <- switch(
   ARM,
@@ -116,49 +137,23 @@ WEIGHT_HOLDINGS <- (ARM == "weighted")
 # the between-arm ARI to mean anything. Weighting it would retain a different
 # subset per arm and confound the comparison.
 
-# Holdings weighting affects the descriptive tables only, never the mixture,
-# so it stays out of FIT_CACHE and OUT_TAG: the fit is reusable across modes
-# and downstream scripts keep finding cluster_assignment_<arm>_<quarter>_us90.
-SUFFIX    <- if (US_ONLY) sprintf("_us%02d", round(100 * US_THRESHOLD)) else ""
-FIT_CACHE <- sprintf("mixture_fits_%s_%s%s.rds", ARM, QUARTER, SUFFIX)
-OUT_TAG   <- sprintf("%s_%s%s", ARM, QUARTER, SUFFIX)
-TAB_TAG   <- paste0(OUT_TAG, if (WEIGHT_HOLDINGS) "_wh" else "")
+# ---- the number of components ---------------------------------------------
+# Chosen in advance, in choosing_k.r, and set here. Nothing below adapts it:
+# if this number is wrong, every table in the script is wrong in the same way,
+# which is the intended trade for a script that runs once instead of sweeping.
+K_FIXED <- 8
 
-K_GRID    <- 5:10       # k values tried in the BIC sweep. See K_RULE: BIC
-                        # does not turn over for this model, so widening the
-                        # grid moves the "winner", it does not settle it.
-
-# EM is run N_RESTART times per k from different starts and the best fit that
-# RETAINS k components is kept. A single start per k compares local optima of
-# varying quality: the first US-only run produced BIC improvements of -138k at
-# k=7 against -70k at k=6 and then +14k at k=8, and k=9 returned a solution
-# bit-identical to k=7. Neither is a property of the data.
-N_RESTART <- 8
-
-# How the reported k is chosen.
-#   "bic"       lowest BIC among fits retaining k components. Honest only if
-#               the curve has an interior minimum -- check the sweep first.
-#   "stability" refit on bootstrap subsamples and keep the k whose partition
-#               reproduces best (mean ARI across pairs of subsample fits).
-#               Independent of any likelihood penalty, which is what makes it
-#               usable when BIC fails.
-#   "fixed"     take K_FINAL, chosen on interpretability and documented.
-
-K_RULE    <- "stability"  # "bic", "stability" or "fixed"
-
-STAB_B    <- 20         # subsample fits per k
-
-STAB_FRAC <- 0.80       # share of investors in each subsample
-
-STAB_KMIN <- 4          # smallest k eligible for the stability ARGMAX. The
-                        # curve is computed and printed for the whole grid;
-                        # this only governs which k can win. See the note in
-                        # the stability branch for why 2 and 3 are excluded.
-
-K_FINAL   <- 8         # NA = take the BIC winner; or set a number yourself.
-                        # Reset explicitly below, because re-sourcing in the
-                        # same session would otherwise leave it numeric from
-                        # the previous run and silently ignore a new best_k.
+# EM is run N_RESTART times from different starts and the best fit that
+# RETAINS K_FIXED components is kept.
+#
+# LEFT AT 2 DELIBERATELY, to keep the reported fit bit-identical to what the
+# sweeping version produced at the same k, seed and minprior. Raise it if
+# reproducing the earlier numbers stops mattering: with only one k there is no
+# longer a neighbouring fit to make a bad local optimum visible as a kinked
+# BIC step, and the weighted arm's likelihood surface is rough enough that one
+# survived best-of-eight on the full sample. 8-10 restarts is cheap now that
+# the grid is gone, and it changes the fit, so it is not done silently here.
+N_RESTART <- 2
 
 SEED      <- 42
 MINPRIOR  <- 0.01       # smallest allowed cluster share (~1% of investors)
@@ -167,9 +162,22 @@ MIN_COMP  <- 150        # ...but never fewer than this many investors,
                         # small subsets such as the US-only run
 MIN_SHARE <- 0.10       # issuer must be held by >=10% of a cluster to be shown
 
+# Holdings weighting affects the descriptive tables only, never the mixture,
+# so it stays out of FIT_CACHE and OUT_TAG: the fit is reusable across modes
+# and downstream scripts keep finding cluster_assignment_<arm>_<quarter>_us90.
+#
+# K IS IN THE CACHE KEY. It was not, when the cache held a whole sweep keyed
+# by k internally and a missing k raised an error. A single-fit cache has no
+# such guard, so without k in the name a fit made at one k would load silently
+# at another and every table below would describe the wrong partition.
+SUFFIX    <- if (US_ONLY) sprintf("_us%02d", round(100 * US_THRESHOLD)) else ""
+FIT_CACHE <- sprintf("mixture_fit_%s_%s_k%d%s.rds", ARM, QUARTER, K_FIXED, SUFFIX)
+OUT_TAG   <- sprintf("%s_%s%s", ARM, QUARTER, SUFFIX)
+TAB_TAG   <- paste0(OUT_TAG, if (WEIGHT_HOLDINGS) "_wh" else "")
+
 # ========================= 1. LOAD + CLUSTER =================================
-cat(sprintf("Quarter: %s | arm: %s | universe: %s\nEmbeddings: %s\n",
-            QUARTER, ARM,
+cat(sprintf("Quarter: %s | arm: %s | k: %d | universe: %s\nEmbeddings: %s\n",
+            QUARTER, ARM, K_FIXED,
             if (US_ONLY) sprintf("US-only (>=%.0f%% US positions)", 100*US_THRESHOLD)
             else "global", EMB_FILE))
 
@@ -348,18 +356,25 @@ if (US_ONLY) {
               format(nrow(long_base), big.mark = ",")))
 }
 
-# The cache key is ARM + QUARTER + SUFFIX, none of which changed when the
-# embeddings were rebuilt with --coverage paper. A cache from the superseded
-# first-chunk run would therefore load silently and every result below would
-# describe the old representation. The provenance recorded inside the file is
-# checked instead of trusting the name.
+# The cache key is ARM + QUARTER + K_FIXED + SUFFIX, none of which changed when
+# the embeddings were rebuilt with --coverage paper. A cache from the
+# superseded first-chunk run would therefore load silently and every result
+# below would describe the old representation. The provenance recorded inside
+# the file is checked instead of trusting the name.
 cache_ok <- FALSE
 if (file.exists(FIT_CACHE)) {
   cached <- readRDS(FIT_CACHE)
   stale <- c(
+    if (is.null(cached$fit)) "holds no fit"
+    else NULL,
     if (is.null(cached$emb_file)) "written before provenance was recorded"
     else if (!identical(cached$emb_file, EMB_FILE))
       sprintf("fitted on %s, not %s", cached$emb_file, EMB_FILE),
+    # k is in the filename, but a renamed or hand-copied file would defeat
+    # that; the recorded value is what is actually trusted.
+    if (is.null(cached$k)) "records no k"
+    else if (!identical(as.integer(cached$k), as.integer(K_FIXED)))
+      sprintf("fitted at k = %d, now k = %d", cached$k, K_FIXED),
     if (!is.null(cached$n_obs) && !identical(cached$n_obs, nrow(X)))
       sprintf("fitted on %s investors, now %s",
               format(cached$n_obs, big.mark = ","),
@@ -376,13 +391,13 @@ if (file.exists(FIT_CACHE)) {
 }
 
 if (cache_ok) {
-  cat(sprintf("Loading cached mixture fits from %s\n", FIT_CACHE))
-  fits <- cached$fits; sweep <- cached$sweep
-  print(sweep)
+  cat(sprintf("Loading cached mixture fit from %s\n", FIT_CACHE))
+  spc <- cached$fit
+  cat(sprintf("k=%2d -> BIC = %10.0f  (cached)\n", K_FIXED, BIC(spc)))
 } else {
   # minprior is a SHARE, so on a smaller sample it permits smaller components
   # in absolute terms. Components of a few dozen investors readily collapse
-  # (rho -> 1) and return a non-finite likelihood, which aborts the sweep.
+  # (rho -> 1) and return a non-finite likelihood, which aborts the fit.
   # The floor is therefore raised until it admits at least MIN_COMP investors.
   eff_minprior <- max(MINPRIOR, MIN_COMP / nrow(X))
   if (eff_minprior > MINPRIOR)
@@ -391,9 +406,11 @@ if (cache_ok) {
         sprintf("smallest admissible component holds >= %d investors\n", MIN_COMP),
         sep = "")
 
-  # One EM run per k compares local optima, not models. Restart and keep the
-  # best fit that retained k components; report how many restarts collapsed,
-  # because a k that collapses often is unstable regardless of its BIC.
+  # One EM run compares nothing. Restart and keep the best fit that retained
+  # k components; report how many restarts collapsed, because a k that
+  # collapses often is unstable regardless of its BIC. With the sweep gone
+  # this bookkeeping is the ONLY signal that the requested k is hard to fit,
+  # so it is printed even when a fit succeeds.
   fit_k <- function(k, n_restart, seed0) {
     best <- NULL; n_ok <- 0L; n_collapse <- 0L; n_fail <- 0L
     for (s in seq_len(n_restart)) {
@@ -410,187 +427,31 @@ if (cache_ok) {
     list(fit = best, n_ok = n_ok, n_collapse = n_collapse, n_fail = n_fail)
   }
 
-  sweep <- data.frame(); fits <- list()
-  for (k in K_GRID) {
-    r <- fit_k(k, N_RESTART, SEED)
-    if (is.null(r$fit)) {
-      cat(sprintf("k=%2d -> no restart retained %d components (%d collapsed, %d failed)\n",
-                  k, k, r$n_collapse, r$n_fail))
-      next
-    }
-    fits[[as.character(k)]] <- r$fit
-    sweep <- rbind(sweep, data.frame(
-      k_asked = k, k_kept = length(unique(clusters(r$fit))),
-      logLik = as.numeric(logLik(r$fit)), BIC = BIC(r$fit),
-      n_ok = r$n_ok, n_collapse = r$n_collapse, n_fail = r$n_fail))
-    cat(sprintf("k=%2d -> BIC = %10.0f  (%d/%d restarts kept %d components)\n",
-                k, BIC(r$fit), r$n_ok, N_RESTART, k))
-  }
-  if (!nrow(sweep)) stop("every k failed; raise MIN_COMP or shorten K_GRID")
-  saveRDS(list(fits = fits, sweep = sweep, emb_file = EMB_FILE,
+  r <- fit_k(K_FIXED, N_RESTART, SEED)
+  if (is.null(r$fit))
+    stop(sprintf(paste0(
+      "no restart retained %d components (%d collapsed, %d failed).\n",
+      "  The data will not support k = %d under minprior = %.4f.\n",
+      "  Lower K_FIXED, raise N_RESTART, or revisit choosing_k.r."),
+      K_FIXED, r$n_collapse, r$n_fail, K_FIXED, eff_minprior))
+  spc <- r$fit
+  cat(sprintf("k=%2d -> BIC = %10.0f  (%d/%d restarts kept %d components, %d collapsed, %d failed)\n",
+              K_FIXED, BIC(spc), r$n_ok, N_RESTART, K_FIXED,
+              r$n_collapse, r$n_fail))
+  if (r$n_ok < N_RESTART)
+    cat("[warn] not every restart retained k components; the reported fit is\n",
+        "       the best of the survivors. Treat k as marginal for this sample.\n",
+        sep = "")
+
+  saveRDS(list(fit = spc, k = K_FIXED, emb_file = EMB_FILE,
                n_obs = nrow(X), context_window = CONTEXT_WINDOW,
                us_threshold = if (US_ONLY) US_THRESHOLD else NA_real_,
+               minprior = eff_minprior,
+               n_ok = r$n_ok, n_collapse = r$n_collapse, n_fail = r$n_fail,
                seed = SEED, n_restart = N_RESTART), FIT_CACHE)
-  cat(sprintf("Cached mixture fits -> %s\n", FIT_CACHE))
-}
-# ---- is BIC even usable here? --------------------------------------------
-# A spherical Cauchy component in d dimensions costs ~d+1 parameters (d-1 free
-# for mu on the sphere, plus rho, plus a mixing weight). The BIC penalty is
-# therefore about (d+1)*log(n) per component, which for d = 64 and n in the
-# thousands is a few hundred -- against likelihood gains in the tens of
-# thousands. BIC is then effectively pure log-likelihood, which is monotone in
-# k, and it will select whatever the largest fitted k happens to be. Heavy
-# Cauchy tails compound this: no component is ever badly misfit, so no k is
-# ever penalised for being too small.
-#
-# The diagnostic below states the arithmetic rather than leaving the reader to
-# discover a boundary selection.
-d_emb    <- ncol(X)
-pen_comp <- (d_emb + 1) * log(nrow(X))
-d_bic    <- diff(sweep$BIC[order(sweep$k_asked)])
-cat(sprintf(paste0(
-  "\n=== Can BIC select k here? ===\n",
-  "  penalty per added component : %8.0f   ((d+1) log n, d = %d, n = %s)\n",
-  "  median |BIC improvement|    : %8.0f\n",
-  "  ratio                       : %8.1f x\n"),
-  pen_comp, d_emb, format(nrow(X), big.mark = ","),
-  median(abs(d_bic)), median(abs(d_bic)) / pen_comp))
-monotone <- all(d_bic < 0)
-if (monotone)
-  cat("  BIC falls at EVERY step: no interior minimum exists on this grid.\n",
-      "  A 'winner' would be the grid boundary. Use K_RULE = \"stability\".\n",
-      sep = "")
-
-ok_fit <- sweep$k_kept == sweep$k_asked
-if (any(!ok_fit))
-  cat(sprintf("\n[note] k = %s never retained k components across %d restarts\n",
-              paste(sweep$k_asked[!ok_fit], collapse = ", "), N_RESTART))
-if (!any(ok_fit)) stop("no k retained the requested number of components")
-best_k_bic <- sweep$k_asked[ok_fit][which.min(sweep$BIC[ok_fit])]
-cat(sprintf("\nBIC minimum among eligible fits: k = %d%s\n", best_k_bic,
-            if (best_k_bic == max(sweep$k_asked[ok_fit]))
-              "  (TOP OF THE ELIGIBLE RANGE - not an interior optimum)" else ""))
-
-# ---- stability selection --------------------------------------------------
-# Refit on overlapping subsamples and ask how reproducible each k's partition
-# is. Two fits are compared on the investors they share, by adjusted Rand
-# index. This uses no likelihood penalty at all, which is exactly why it still
-# works when BIC does not: a k that splits real structure reproduces; a k that
-# splits noise does not.
-stability_curve <- NULL
-if (K_RULE == "stability") {
-  cat(sprintf("\n=== Stability selection (%d subsamples of %.0f%%, ARI) ===\n",
-              STAB_B, 100 * STAB_FRAC))
-  ks <- sweep$k_asked[ok_fit]
-  stability_curve <- purrr::map_dfr(ks, function(k) {
-    parts <- vector("list", STAB_B)
-    for (b in seq_len(STAB_B)) {
-      set.seed(SEED + 7919L * k + b)
-      idx_b <- sample(nrow(X), floor(STAB_FRAC * nrow(X)))
-      f <- try(flexmix(X[idx_b, , drop = FALSE] ~ 1, k = k,
-                       model = FLXMCspcauchy(),
-                       control = list(minprior = eff_minprior)), silent = TRUE)
-      if (inherits(f, "try-error") || !is.finite(as.numeric(logLik(f)))) next
-      parts[[b]] <- setNames(clusters(f), idx_b)
-    }
-    parts <- Filter(Negate(is.null), parts)
-    if (length(parts) < 2) return(tibble(k = k, mean_ari = NA_real_,
-                                         sd_ari = NA_real_, n_pairs = 0L))
-    aris <- c()
-    for (i in seq_len(length(parts) - 1)) for (j in (i + 1):length(parts)) {
-      shared <- intersect(names(parts[[i]]), names(parts[[j]]))
-      if (length(shared) < 100) next
-      aris <- c(aris, mclust::adjustedRandIndex(parts[[i]][shared],
-                                                parts[[j]][shared]))
-    }
-    cat(sprintf("  k=%2d  mean ARI = %.3f  (sd %.3f, %d pairs)\n",
-                k, mean(aris), stats::sd(aris), length(aris)))
-    tibble(k = k, mean_ari = mean(aris), sd_ari = stats::sd(aris),
-           n_pairs = length(aris))
-  })
+  cat(sprintf("Cached mixture fit -> %s\n", FIT_CACHE))
 }
 
-best_k <- switch(
-  K_RULE,
-  bic = best_k_bic,
-    stability = {
-    if (is.null(stability_curve) || all(is.na(stability_curve$mean_ari)))
-      stop("stability selection produced no usable ARI values")
-
-    # Why k = 2 cannot be allowed to win. A two-component split of ANY point
-    # cloud reproduces almost perfectly across subsamples: the two halves are
-    # far apart relative to the noise, so every subsample recovers the same
-    # cut. Mean ARI is therefore near 1 at k = 2 whatever the data, and an
-    # unrestricted argmax returns 2 mechanically. The criterion is rewarding
-    # coarseness, not structure. On this panel k = 2 scored 0.993 against
-    # 0.64-0.73 everywhere above k = 3. Restricting the argmax to
-    # k >= STAB_KMIN asks the question actually intended -- among the
-    # resolutions worth reporting, which reproduces best -- while the full
-    # curve is still printed above, so the excluded values stay auditable.
-    elig <- stability_curve |> filter(k >= STAB_KMIN, !is.na(mean_ari))
-    if (!nrow(elig))
-      stop(sprintf("no k >= %d has a usable ARI; lower STAB_KMIN", STAB_KMIN))
-
-    dropped <- stability_curve |> filter(k < STAB_KMIN, !is.na(mean_ari))
-    if (nrow(dropped))
-      cat(sprintf("\n[note] k = %s excluded from the argmax (ARI %s):\n",
-                  paste(dropped$k, collapse = ", "),
-                  paste(sprintf("%.3f", dropped$mean_ari), collapse = ", ")),
-          sprintf("       a coarse split reproduces trivially. STAB_KMIN = %d.\n",
-                  STAB_KMIN), sep = "")
-
-    i_best <- which.max(elig$mean_ari)
-    kk <- elig$k[i_best]
-    cat(sprintf("\nStability selects k = %d (mean ARI %.3f, sd %.3f)\n",
-                kk, elig$mean_ari[i_best], elig$sd_ari[i_best]))
-
-    # Report the spread so a flat curve is not read as a sharp optimum. This
-    # is a legibility check, not a test: the ARI pairs share fits and are not
-    # independent, so no honest standard error is available here.
-    cat(sprintf("  eligible range: ARI %.3f-%.3f over k = %d-%d, median sd %.3f\n",
-                min(elig$mean_ari), max(elig$mean_ari),
-                min(elig$k), max(elig$k), stats::median(elig$sd_ari)))
-    if (diff(range(elig$mean_ari)) < stats::median(elig$sd_ari))
-      cat("  [warn] between-k differences are smaller than the within-k spread.\n",
-          "         Read this as 'no k in range is distinguishable', not as a\n",
-          "         selection. Choose k on interpretability and say so.\n", sep = "")
-
-    if (best_k_bic != kk)
-      cat(sprintf("  BIC would have taken k = %d; they disagree, which is the\n",
-                  best_k_bic),
-          "  expected outcome when the BIC curve has no interior minimum.\n",
-          sep = "")
-    kk
-  },
-  fixed = {
-    if (is.na(K_FINAL))
-      stop("K_RULE is \"fixed\" but K_FINAL is NA; set it in the CONFIG block")
-    K_FINAL
-  },
-  stop("K_RULE must be \"bic\", \"stability\" or \"fixed\""))
-
-# Re-sourcing safety. K_FINAL is overwritten below with a number, so a second
-# source() in the same session would find it already numeric and never consult
-# the new best_k. The user's choice is therefore captured UNCONDITIONALLY from
-# whatever the CONFIG block currently says: an earlier `if (!exists(...))`
-# guard here was worse than the bug, because it froze the first run's NA and
-# silently discarded any manual K_FINAL set afterwards.
-K_FINAL_USER <- K_FINAL
-K_FINAL <- if (is.na(K_FINAL_USER)) best_k else K_FINAL_USER
-
-# --- 3. a manually chosen k may not have been fitted at all ---
-if (is.null(fits[[as.character(K_FINAL)]]))
-  stop(sprintf(paste0("no fit stored at k = %d.\n",
-                      "  Fitted k: %s\n",
-                      "  (k values that failed or collapsed are absent.)"),
-               K_FINAL, paste(names(fits), collapse = ", ")))
-if (!is.na(K_FINAL_USER) && K_FINAL_USER != best_k)
-  cat(sprintf("[note] K_FINAL set manually to %d; %s would have chosen %d\n",
-              K_FINAL_USER,
-              switch(K_RULE, bic = "BIC", stability = "stability selection",
-                     fixed = "the fixed rule"),
-              best_k))
-spc    <- fits[[as.character(K_FINAL)]]
 labels <- clusters(spc)
 cl_df  <- tibble(investor_id = meta$investor_id, cluster = labels)
 
@@ -601,9 +462,26 @@ sizes <- cl_df |> count(cluster, name = "size")
 # below would recycle silently.
 if (length(rho) != nrow(sizes))
   stop(sprintf("fit at k = %d has %d rho values but %d non-empty clusters",
-               K_FINAL, length(rho), nrow(sizes)))
+               K_FIXED, length(rho), nrow(sizes)))
 sizes <- sizes |> mutate(rho = round(rho, 3))
 cat("\n=== Cluster sizes and concentration ===\n"); print(sizes, n = Inf)
+
+# The smallest component against the floor that admitted it. Once a component
+# sits near minprior it is limited by the constraint rather than by the data,
+# and is at risk of disappearing at the next k. Printed here because the sweep
+# that used to make this visible across k is gone.
+# `else` must stay on this line: at top level R closes the if-expression at
+# the end of a line, and a leading `else` on the next one is a parse error.
+eff_minprior_used <- if (cache_ok) cached$minprior else
+                     max(MINPRIOR, MIN_COMP / nrow(X))
+if (!is.null(eff_minprior_used)) {
+  floor_n <- ceiling(eff_minprior_used * nrow(X))
+  cat(sprintf("  smallest component %s vs floor %s (minprior %.4f)%s\n",
+              format(min(sizes$size), big.mark = ","),
+              format(floor_n, big.mark = ","), eff_minprior_used,
+              if (min(sizes$size) < 1.5 * floor_n)
+                "  <- within 1.5x the floor; the constraint is binding" else ""))
+}
 
 # ========================= 2. ATTACH REFERENCE DATA ==========================
 # country_desc / iso_country / region_code exist in BOTH reference tables with
@@ -1076,9 +954,15 @@ if (nrow(strat) >= 2)
               strat$attribute[2], strat$strength[2]))
 
 # ========================= 5. SAVE ===========================================
-saveRDS(list(cluster = cl_df, k = K_FINAL, rho = rho, sweep = sweep,
-             k_rule = K_RULE, stability = stability_curve,
-             best_k_bic = best_k_bic, n_restart = N_RESTART,
+# sweep / stability / best_k_bic / k_rule are kept as NULL/NA placeholders.
+# They no longer have values -- selection happens in choosing_k.r -- but the
+# KEYS stay, so a downstream reader that expects them (Cluster_Dynamics_v3.r)
+# gets an explicit empty value rather than a silent NULL from a missing name.
+# k_source records where the number came from, replacing k_rule's role.
+saveRDS(list(cluster = cl_df, k = K_FIXED, rho = rho,
+             k_source = "fixed in Clusters.r; selected in choosing_k.r",
+             k_rule = NA_character_, sweep = NULL, stability = NULL,
+             best_k_bic = NA_integer_, n_restart = N_RESTART,
              posterior = posterior(spc), seed = SEED, quarter = QUARTER,
              arm = ARM, emb_file = EMB_FILE,
              context_window = CONTEXT_WINDOW, weight_holdings = WEIGHT_HOLDINGS,

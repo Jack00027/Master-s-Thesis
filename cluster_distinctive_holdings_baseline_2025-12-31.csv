@@ -1,0 +1,49 @@
+"cluster","name","p_cl","lift"
+1,"Raytheon Technologies Corp.",0.87,18.6
+1,"The Boeing Co.",0.59,18.5
+1,"AT&T, Inc.",0.92,18.3
+1,"GE VERNOVA INC  COM",0.9,17.3
+1,"Verizon Communications, Inc.",0.9,17
+1,"Philip Morris International, Inc.",0.86,17
+1,"McDonald's Corp.",0.98,16.4
+1,"Amgen, Inc.",0.92,16.2
+2,"Contemporary Amperex Technology Co., Ltd.",0.12,1.1
+4,"HSBC Holdings Plc",0.29,5.1
+4,"Lloyds Banking Group Plc",0.13,4.9
+4,"Deutsche Bank AG",0.14,4.8
+4,"Barclays PLC",0.18,4.8
+4,"Banco Santander SA",0.29,4.8
+4,"Rolls-Royce Holdings Plc",0.15,4.7
+4,"UBS Group AG",0.2,4.7
+4,"Zurich Insurance Group AG",0.18,4.7
+5,"HANSONG NANJING TECHNOLOGY  DOM SH",0.14,4.7
+5,"The Bank of New York Mellon Corp.",0.12,4.5
+5,"MarcoPolo Holdings Co., Ltd.",0.14,4.5
+5,"Shanghai C&D INNOSTIC Medical Technology Group Co., Ltd.",0.15,4.5
+5,"RNBC NEW ENERGY CO LTD  DOM SH",0.15,4.5
+5,"XIAMEN HENGKUN NEW MATERIAL  DOM SH",0.14,4.4
+5,"SHENZHEN TIANSU CALIBRATION  ORD A",0.12,4.4
+5,"ICkey (Shanghai) Internet & Technology Co., Ltd.",0.17,4.4
+6,"Hindalco Industries Ltd.",0.11,5.2
+6,"KB Financial Group, Inc.",0.12,5.2
+6,"HCL Technologies Ltd.",0.12,5.2
+6,"Hindustan Unilever Ltd.",0.11,5.1
+6,"Sun Pharmaceutical Industries Ltd.",0.11,4.9
+6,"Bajaj Finance Ltd.",0.16,4.9
+6,"Hon Hai Precision Industry Co., Ltd.",0.12,4.8
+6,"Tata Consultancy Services Ltd.",0.15,4.8
+7,"Alibaba Group Holding Ltd.",0.11,1
+7,"Taiwan Semiconductor Manufacturing Co., Ltd.",0.13,0.8
+7,"Tencent Holdings Ltd.",0.1,0.8
+7,"Microsoft Corp.",0.17,0.7
+7,"Amazon.com, Inc.",0.14,0.7
+7,"Alphabet, Inc.",0.17,0.7
+7,"NVIDIA Corp.",0.13,0.6
+8,"Ferrari NV",0.1,3.4
+8,"Compagnie de Saint-Gobain SA",0.13,3.3
+8,"Deutsche Börse AG",0.12,3.1
+8,"Infineon Technologies AG",0.15,2.9
+8,"L'Oréal SA",0.19,2.9
+8,"EssilorLuxottica SA",0.15,2.8
+8,"Hermès International SCA",0.13,2.8
+8,"Schneider Electric SE",0.28,2.7

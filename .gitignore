@@ -22,3 +22,5 @@ report_*/
 embeddings_v3/
 models_v3/
 reference/_cache/
+mixture_fit_*.rds
+*.bak.parquet

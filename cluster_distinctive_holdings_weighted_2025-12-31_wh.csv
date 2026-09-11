@@ -1,0 +1,27 @@
+"cluster","name","p_cl","lift"
+1,"Raytheon Technologies Corp.",0.87,18.5
+1,"The Boeing Co.",0.58,18.4
+1,"AT&T, Inc.",0.93,18.4
+1,"GE VERNOVA INC  COM",0.9,17.4
+1,"Verizon Communications, Inc.",0.9,17
+1,"Philip Morris International, Inc.",0.86,16.9
+1,"Amgen, Inc.",0.93,16.4
+1,"McDonald's Corp.",0.98,16.4
+2,"Zhongji Innolight Co., Ltd.",0.13,1.9
+2,"Eoptolink Technology Inc., Ltd.",0.11,1.9
+2,"HSBC Holdings Plc",0.1,1.8
+2,"Luxshare Precision Industry Co. Ltd.",0.1,1.8
+2,"Cambricon Technologies Corp. Ltd.",0.1,1.8
+2,"Tesla, Inc.",0.19,1.7
+2,"Zijin Mining Group Co., Ltd.",0.13,1.7
+2,"Banco Santander SA",0.1,1.7
+3,"Microsoft Corp.",0.1,0.4
+3,"Alphabet, Inc.",0.1,0.4
+4,"Taiwan Semiconductor Manufacturing Co., Ltd.",0.21,1.3
+4,"Schneider Electric SE",0.13,1.3
+4,"LVMH Moët Hennessy Louis Vuitton SE",0.11,1.2
+4,"Alibaba Group Holding Ltd.",0.14,1.2
+4,"Tencent Holdings Ltd.",0.15,1.2
+4,"ASML Holding NV",0.18,1.1
+4,"SAP SE",0.13,1.1
+4,"Microsoft Corp.",0.25,1

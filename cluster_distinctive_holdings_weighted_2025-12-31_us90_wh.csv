@@ -1,65 +1,65 @@
 "cluster","name","p_cl","lift"
-1,"General Dynamics Corp.",0.18,3.2
-1,"The Bank of New York Mellon Corp.",0.26,3.2
-1,"General Motors Co.",0.23,3.2
-1,"Bristol Myers Squibb Co.",0.38,3.1
-1,"Parker-Hannifin Corp.",0.26,3.1
-1,"The Travelers Cos., Inc.",0.2,3.1
-1,"Northrop Grumman Corp.",0.12,3
-1,"Lockheed Martin Corp.",0.18,2.9
-2,"Shopify, Inc.",0.17,4.5
-2,"Snowflake, Inc.",0.24,4.5
-2,"CrowdStrike Holdings, Inc.",0.27,4.2
-2,"Cadence Design Systems, Inc.",0.31,4.1
-2,"Spotify Technology SA",0.13,4.1
-2,"Synopsys, Inc.",0.27,4
-2,"Workday, Inc.",0.17,4
-2,"Fortinet, Inc.",0.18,3.9
-3,"Fidelity Series Small Cap Opportunities Fund",1,30.2
-3,"Fidelity Series All Sector Equity Fund",0.58,30.2
-3,"Fidelity Inv. Trust - Emerging Markets Opportunities Fund",1,30.2
-3,"Fidelity Series Investment Grade Bond Fund",0.87,30.2
-3,"Fidelity Inv. Trust - Series International Growth Fund",0.98,30.2
-3,"Fidelity Inv. Trust - Series International Small Cap Fund",1,30.2
-3,"Fidelity Inv. Trust - Series International Value Fund",0.98,30.2
-3,"Fidelity Series Commodity Strategy Fund",1,30.2
-4,"Prologis, Inc.",0.1,1.1
-4,"Chevron Corp.",0.14,0.7
-4,"Verizon Communications, Inc.",0.12,0.6
-4,"Merck & Co., Inc.",0.16,0.6
-4,"Microsoft Corp.",0.27,0.6
-4,"The Charles Schwab Corp.",0.1,0.6
-4,"JPMorgan Chase & Co.",0.18,0.6
-4,"Alphabet, Inc.",0.26,0.6
-5,"Ligand Pharmaceuticals, Inc.",0.11,7.1
-5,"Arrowhead Pharmaceuticals, Inc.",0.19,7.1
-5,"Glaukos Corp.",0.22,7
-5,"Krystal Biotech, Inc.",0.17,7
-5,"Atmus Filtration Technologies, Inc.",0.13,7
-5,"ESCO Technologies, Inc.",0.18,6.9
-5,"Semtech Corp.",0.23,6.9
-5,"ADMA Biologics, Inc.",0.11,6.9
-6,"BLACKROCK INC  COM",0.4,5
-6,"Accenture Plc",0.58,4.6
-6,"S&P Global, Inc.",0.54,4.5
-6,"Deere & Co.",0.34,4.3
-6,"Intel Corp.",0.39,4.3
-6,"Eaton Corp. Plc",0.37,4.3
-6,"Union Pacific Corp.",0.41,4.2
-6,"Danaher Corp.",0.39,4
-7,"GE VERNOVA INC  COM",0.96,5.6
-7,"Raytheon Technologies Corp.",0.93,5.2
-7,"Abbott Laboratories",1,5.1
-7,"Intuitive Surgical, Inc.",0.99,5.1
-7,"Philip Morris International, Inc.",0.93,5.1
-7,"Linde Plc",0.97,5.1
-7,"Thermo Fisher Scientific, Inc.",1,5
-7,"Amgen, Inc.",0.98,4.9
-8,"Fidelity National Financial, Inc.",0.12,5.3
-8,"W.P. Carey, Inc.",0.13,5
-8,"RPM International, Inc.",0.14,4.9
-8,"Unum Group",0.12,4.8
-8,"Alcoa Corp.",0.16,4.8
-8,"Omega Healthcare Investors, Inc.",0.16,4.6
-8,"Royal Gold, Inc.",0.16,4.6
-8,"Toll Brothers, Inc.",0.14,4.6
+1,"Chevron Corp.",0.13,0.6
+1,"Microsoft Corp.",0.28,0.6
+1,"The Charles Schwab Corp.",0.1,0.6
+1,"Amazon.com, Inc.",0.24,0.6
+1,"JPMorgan Chase & Co.",0.17,0.6
+1,"Alphabet, Inc.",0.28,0.6
+1,"Apple, Inc.",0.21,0.5
+1,"Verizon Communications, Inc.",0.11,0.5
+2,"Ligand Pharmaceuticals, Inc.",0.13,8
+2,"ADMA Biologics, Inc.",0.12,7.8
+2,"Atmus Filtration Technologies, Inc.",0.14,7.8
+2,"EnPro Industries, Inc.",0.13,7.7
+2,"Ameris Bancorp",0.17,7.5
+2,"ESCO Technologies, Inc.",0.19,7.5
+2,"PJT Partners, Inc.",0.1,7.5
+2,"Merit Medical Systems, Inc.",0.17,7.4
+3,"Archer-Daniels-Midland Co.",0.14,4.9
+3,"T. Rowe Price Group, Inc.",0.13,4.5
+3,"Edison International",0.13,4.4
+3,"CF Industries Holdings, Inc.",0.13,4.4
+3,"Consolidated Edison, Inc.",0.13,4.3
+3,"Omnicom Group, Inc.",0.16,4.2
+3,"Dover Corp.",0.11,4.1
+3,"General Mills, Inc.",0.12,4.1
+4,"GE VERNOVA INC  COM",0.94,5.5
+4,"Abbott Laboratories",0.99,5
+4,"Intuitive Surgical, Inc.",0.98,5
+4,"Thermo Fisher Scientific, Inc.",0.99,5
+4,"Raytheon Technologies Corp.",0.91,5
+4,"Linde Plc",0.97,5
+4,"Philip Morris International, Inc.",0.89,4.9
+4,"Amgen, Inc.",0.96,4.8
+5,"Eaton Corp. Plc",0.34,3.9
+5,"BLACKROCK INC  COM",0.31,3.8
+5,"Union Pacific Corp.",0.36,3.7
+5,"Danaher Corp.",0.35,3.6
+5,"Deere & Co.",0.28,3.6
+5,"Capital One Financial Corp.",0.39,3.4
+5,"S&P Global, Inc.",0.41,3.4
+5,"Boston Scientific Corp.",0.34,3.3
+6,"Snowflake, Inc.",0.23,4.4
+6,"Shopify, Inc.",0.16,4.3
+6,"Spotify Technology SA",0.14,4.2
+6,"Cadence Design Systems, Inc.",0.31,4.1
+6,"CrowdStrike Holdings, Inc.",0.27,4.1
+6,"Fortinet, Inc.",0.19,4
+6,"Synopsys, Inc.",0.26,3.9
+6,"Workday, Inc.",0.16,3.9
+7,"Fidelity Series Small Cap Opportunities Fund",1,30.2
+7,"Fidelity Series All Sector Equity Fund",0.58,30.2
+7,"Fidelity Inv. Trust - Emerging Markets Opportunities Fund",1,30.2
+7,"Fidelity Series Investment Grade Bond Fund",0.87,30.2
+7,"Fidelity Inv. Trust - Series International Growth Fund",0.98,30.2
+7,"Fidelity Inv. Trust - Series International Small Cap Fund",1,30.2
+7,"Fidelity Inv. Trust - Series International Value Fund",0.98,30.2
+7,"Fidelity Series Commodity Strategy Fund",1,30.2
+8,"D-Wave Quantum, Inc.",0.15,11.6
+8,"RB Global, Inc.",0.22,10.9
+8,"Tempur Sealy International, Inc.",0.4,10.6
+8,"Joby Aviation, Inc.",0.14,10.4
+8,"Hecla Mining Co.",0.36,10.3
+8,"Guidewire Software, Inc.",0.43,10.2
+8,"XPO, Inc.",0.37,10.2
+8,"Hims & Hers Health, Inc.",0.16,10.1
