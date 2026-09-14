@@ -121,7 +121,7 @@ SEC_REF   <- "reference/securities_master.parquet"
 # reference table are excluded from both numerator and denominator. It is
 # computed on the top-CONTEXT_WINDOW slice, i.e. the same positions the
 # encoder saw, not on the whole book.
-US_ONLY      <- TRUE   # TRUE = cluster only predominantly-US investors
+US_ONLY      <- FALSE   # TRUE = cluster only predominantly-US investors
 US_THRESHOLD <- 0.90    # min share of an investor's positions in US issuers
 
 # Weight the Lens C / inv_feat tables by portfolio share instead of counting
