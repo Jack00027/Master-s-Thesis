@@ -76,7 +76,7 @@ set -euo pipefail
 ARM="${ARM:-weighted}"
 
 # One script for both arms; --pooling is the only difference.
-SCRIPT="BERT_training_weighted.py"
+SCRIPT="02_embeddings/BERT_training_weighted.py"
 
 case "$ARM" in
   weighted)

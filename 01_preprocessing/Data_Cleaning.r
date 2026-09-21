@@ -74,7 +74,7 @@ wrds <- dbConnect(
   Postgres(),
   host = "wrds-pgdata.wharton.upenn.edu", dbname = "wrds",
   port = 9737, sslmode = "require",
-  user = Sys.getenv("WRDS_USER"), password = Sys.getenv("WRDS_PASSWORD"),
+  user = Sys.getenv("WRDS_USER"), password = Sys.getenv("WRDS_PASS"),
   connect_timeout = 30
 )
 
