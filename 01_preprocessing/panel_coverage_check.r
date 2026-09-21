@@ -2,7 +2,7 @@
 # panel_coverage_check.r — how many investors survive across Q4s?
 #
 # Reads embedding files only. No clustering, no EM. Run this before
-# Cluster_Dynamics_v2.r to see whether the panel supports the analysis.
+# Cluster_Dynamics.r to see whether the panel supports the analysis.
 #
 # The three numbers that matter, and what each governs:
 #   adjacent-year overlap  -> sequential chaining (the default). Needs to be
