@@ -10,6 +10,6 @@ __pycache__/
 
 # Training outputs (regeneratable, kept out of git)
 output/
-reference/
 data/
 figures/
+reference/
